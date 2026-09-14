@@ -25,7 +25,7 @@ has them.
 
 ```bash
 cargo install --path .
-karat shape --len 1032 --layouts 1032 --account-type UserMetadata
+karat shape --account-type UserMetadata --len 1032
 ```
 
 The command prints a JSON result and exits non-zero on failure, so it can be
