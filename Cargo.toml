@@ -1,0 +1,21 @@
+[package]
+name = "karat67"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Integrity checks for Solana indexers: verify indexed data is correct, not just flowing."
+license = "MIT"
+authors = ["Huu Le"]
+repository = "https://github.com/SGDlab67/karat67"
+keywords = ["solana", "indexer", "data-quality", "integrity"]
+categories = ["development-tools", "data-structures"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "karat"
+path = "src/bin/karat.rs"
