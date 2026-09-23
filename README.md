@@ -28,13 +28,14 @@ cargo install --path .
 karat shape --account-type UserMetadata --len 1032
 ```
 
-The command prints a JSON result and exits non-zero on failure, so it can be
-wired into pipeline checks and CI directly.
+On a terminal the command prints a readable report; piped (or with
+`--json`) it prints JSON. It exits non-zero on failure, so it can be wired
+into pipeline checks and CI directly.
 
 ## Origin
 
 A Kamino Lend indexer ingested empty payloads for `Obligation` and
-`UserMetadata` accounts for 44 hours while every liveness signal stayed
+`UserMetadata` accounts for 158.91 hours while every liveness signal stayed
 green: checkpoints advanced, freshness was low, rows kept arriving, the
 containers were up. Nothing in the monitoring suite asked whether the data
 had the right shape. `karat67` exists so the next pipeline does not learn

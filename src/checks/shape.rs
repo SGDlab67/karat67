@@ -2,7 +2,7 @@
 //! exactly, by discriminator and by byte length.
 //!
 //! Origin: an indexer ingested zero-length payloads for `Obligation` and
-//! `UserMetadata` accounts for 44 hours while every liveness signal stayed
+//! `UserMetadata` accounts for 158.91 hours while every liveness signal stayed
 //! green. The chain does not produce empty, truncated, over-long, or
 //! unknown-discriminator data for allocated accounts, so this failure class
 //! is detectable without any threshold.
@@ -45,10 +45,15 @@ pub const KAMINO_ACCOUNTS: &[AccountSpec] = &[
 /// account type's IDL-declared size (truncated or over-long).
 pub fn check_shape(data: &[u8]) -> CheckResult {
     if data.len() < 8 {
+        let what = if data.is_empty() {
+            "empty payload"
+        } else {
+            "payload too short"
+        };
         return CheckResult::fail(
             "shape",
             format!(
-                "payload too short: {} bytes, need at least 8 for a discriminator",
+                "{what}: {} bytes, every allocated account starts with an 8-byte discriminator",
                 data.len()
             ),
         );
@@ -66,9 +71,21 @@ pub fn check_shape(data: &[u8]) -> CheckResult {
     if data.len() == spec.data_len {
         CheckResult::pass(name)
     } else {
+        let (what, diff) = if data.len() < spec.data_len {
+            (
+                "truncated",
+                format!("{} missing", spec.data_len - data.len()),
+            )
+        } else {
+            ("over-long", format!("{} extra", data.len() - spec.data_len))
+        };
         CheckResult::fail(
             name,
-            format!("expected {} bytes, got {}", spec.data_len, data.len()),
+            format!(
+                "{what}: expected {} bytes, got {} ({diff})",
+                spec.data_len,
+                data.len()
+            ),
         )
     }
 }
@@ -116,6 +133,10 @@ mod tests {
         let data = buffer_with_discriminator(OBLIGATION_DISCRIMINATOR, OBLIGATION_LEN - 1);
         let result = check_shape(&data);
         assert_eq!(result.status, Status::Fail);
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("truncated: expected 3344 bytes, got 3343 (1 missing)")
+        );
     }
 
     #[test]
