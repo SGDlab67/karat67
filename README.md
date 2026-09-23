@@ -12,9 +12,12 @@ CLI that checks indexed data against the chain.
 1. **Shape** - account data length and discriminator against the program IDL.
    Catches the failure class where rows arrive empty while every liveness
    signal stays green.
-2. **Reconciliation** (in progress) - sample N indexed accounts, fetch them
-   via `getMultipleAccounts`, and diff against indexed values, allowing for
-   slot lag.
+2. **Reconciliation** - sample N indexed accounts, fetch them via
+   `getMultipleAccounts`, and byte-diff indexed values against on-chain
+   values. Catches wrong-but-well-shaped rows that the shape check passes.
+   Slot-lag tolerance is threaded through (the RPC context slot rides along
+   on every result) but not yet applied: a mismatch is always a failure for
+   now, never silently a pass.
 3. **Completeness** (planned) - slot coverage compared against `getBlocks`,
    not a contiguous slot range, because Solana leaders skip slots.
 
@@ -25,11 +28,27 @@ has them.
 
 ```bash
 cargo install --path .
+
+# Shape: check an observed payload against the Kamino account registry.
 karat shape --account-type UserMetadata --len 1032
+
+# Reconciliation: diff indexed bytes against on-chain state. Pass the RPC
+# endpoint (or set KARAT_RPC_URL) and, per account, its indexed bytes as
+# base64. --account and --indexed-base64 are repeatable and paired by order.
+karat reconcile \
+  --rpc-url https://api.mainnet-beta.solana.com \
+  --account So11111111111111111111111111111111111111112 \
+  --indexed-base64 "$INDEXED_BASE64"
 ```
 
-The command prints a JSON result and exits non-zero on failure, so it can be
-wired into pipeline checks and CI directly.
+Both commands print a JSON result (reconcile prints one per account) and exit
+non-zero unless every check passed, so they can be wired into pipeline checks
+and CI directly. On a byte mismatch, `reconcile` reports the offending
+account, the indexed vs on-chain lengths, and the first differing byte offset.
+
+The reconciliation client uses a lightweight, rustls-based HTTP client
+(`ureq`) instead of the full `solana-client` stack, so builds stay
+toolchain-only with no OpenSSL system dependency.
 
 ## Origin
 
