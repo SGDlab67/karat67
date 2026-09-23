@@ -7,6 +7,7 @@
 //! unknown-discriminator data for allocated accounts, so this failure class
 //! is detectable without any threshold.
 
+use crate::checks::check::Check;
 use crate::report::CheckResult;
 
 /// IDL-declared shape of one account type: its 8-byte Anchor discriminator
@@ -73,6 +74,44 @@ pub fn check_shape(data: &[u8]) -> CheckResult {
     }
 }
 
+/// A shape check over one observed account payload.
+///
+/// Thin wrapper that lets the shape check participate in the [`Check`] seam
+/// alongside reconciliation and completeness. The logic still lives in
+/// [`check_shape`]; this only borrows the payload and delegates.
+pub struct ShapeCheck<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> ShapeCheck<'a> {
+    /// Build a shape check over `data`, an observed account payload.
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+}
+
+impl Check for ShapeCheck<'_> {
+    fn name(&self) -> String {
+        // Mirror the `check` field `check_shape` will produce so callers can
+        // predict the identifier before running: name by matched account
+        // type when the discriminator is known, else the bare `shape`.
+        if self.data.len() >= 8 {
+            let discriminator: [u8; 8] = self.data[..8].try_into().expect("checked len >= 8");
+            if let Some(spec) = KAMINO_ACCOUNTS
+                .iter()
+                .find(|spec| spec.discriminator == discriminator)
+            {
+                return format!("shape({})", spec.account_type);
+            }
+        }
+        "shape".to_string()
+    }
+
+    fn run(&self) -> CheckResult {
+        check_shape(self.data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +169,28 @@ mod tests {
         let data = buffer_with_discriminator([0, 1, 2, 3, 4, 5, 6, 7], OBLIGATION_LEN);
         let result = check_shape(&data);
         assert_eq!(result.status, Status::Fail);
+    }
+
+    #[test]
+    fn check_trait_run_matches_check_shape() {
+        let data = buffer_with_discriminator(OBLIGATION_DISCRIMINATOR, OBLIGATION_LEN);
+        let via_trait = ShapeCheck::new(&data).run();
+        let via_fn = check_shape(&data);
+        assert_eq!(via_trait.status, via_fn.status);
+        assert_eq!(via_trait.check, via_fn.check);
+    }
+
+    #[test]
+    fn check_trait_name_matches_result_for_known_type() {
+        let data = buffer_with_discriminator(OBLIGATION_DISCRIMINATOR, OBLIGATION_LEN);
+        let check = ShapeCheck::new(&data);
+        assert_eq!(check.name(), "shape(Obligation)");
+        assert_eq!(check.name(), check.run().check);
+    }
+
+    #[test]
+    fn check_trait_name_falls_back_for_unknown_discriminator() {
+        let data = buffer_with_discriminator([0, 1, 2, 3, 4, 5, 6, 7], OBLIGATION_LEN);
+        assert_eq!(ShapeCheck::new(&data).name(), "shape");
     }
 }
