@@ -4,4 +4,6 @@
 //! Freshness and liveness are out of scope by design: every indexer already
 //! has them.
 
+pub mod check;
+pub mod reconcile;
 pub mod shape;
