@@ -83,13 +83,21 @@ containers were up. Nothing in the monitoring suite asked whether the data
 had the right shape. `karat67` exists so the next pipeline does not learn
 this lesson the same way.
 
+
+## Carbon integration
+
+Wire [`KaratIntegrityProcessor`](src/carbon.rs) as a processor **after** account
+decode in a [Carbon](https://github.com/sevenlabs-hq/carbon) pipeline: call
+`check_account(account_type, data)` on the decoded type name and raw bytes.
+No Carbon crate dependency — drop-in from any decode path. An MCP wrapper so
+agents can query integrity status is planned later.
+
 ## Roadmap
 
 - IDL-driven account specs (done for Kamino Lend): new account types are
   `AccountSpec` data; the `Check` trait is the uniform seam. Broader
   multi-program IDL ingest still to come.
-- Carbon integration: integrity checks as a processor, results emitted
-  through the existing metrics layer.
+- Carbon metrics emission for processor results.
 - MCP wrapper so agents can ask whether the indexer behind their data is
   passing integrity checks before acting on it.
 
@@ -100,6 +108,12 @@ pipelines without rewriting the indexer.
 
 Early development, pre-release. API unstable. Built in the open, solo, for
 the Colosseum Crypto World's Fair 2026.
+
+## Demo
+
+```bash
+bash demo/worlds_fair.sh
+```
 
 ## License
 
