@@ -15,9 +15,10 @@ CLI that checks indexed data against the chain.
 2. **Reconciliation** - sample N indexed accounts, fetch them via
    `getMultipleAccounts`, and byte-diff indexed values against on-chain
    values. Catches wrong-but-well-shaped rows that the shape check passes.
-   Slot-lag tolerance is threaded through (the RPC context slot rides along
-   on every result) but not yet applied: a mismatch is always a failure for
-   now, never silently a pass.
+   Optional `--indexed-slot` / `--max-slot-lag` (default 32) tolerate recent
+   indexer lag: a mismatch within the window is `Skipped` with a JSON reason
+   (`"reason":"slot lag"`), never `Pass`. Beyond the window, or with no write
+   slot, a mismatch is still `Fail`.
 3. **Completeness** (planned) - slot coverage compared against `getBlocks`,
    not a contiguous slot range, because Solana leaders skip slots.
 
@@ -35,18 +36,23 @@ karat shape --account-type UserMetadata --len 1032
 # Reconciliation: diff indexed bytes against on-chain state. Pass the RPC
 # endpoint (or set KARAT_RPC_URL) and, per account, its indexed bytes as
 # base64. --account and --indexed-base64 are repeatable and paired by order.
+# Optional --indexed-slot (same count) enables slot-lag tolerance;
+# --max-slot-lag defaults to 32.
 karat reconcile \
   --rpc-url https://api.mainnet-beta.solana.com \
   --account So11111111111111111111111111111111111111112 \
-  --indexed-base64 "$INDEXED_BASE64"
+  --indexed-base64 "$INDEXED_BASE64" \
+  --indexed-slot "$INDEXED_SLOT" \
+  --max-slot-lag 32
 ```
 
 On a terminal, `shape` prints a readable report; piped (or with `--json`) it
 prints JSON. `reconcile` prints one JSON result per account. Both exit
-non-zero unless every check passed, so they can be wired into pipeline
-checks and CI directly. On a byte mismatch, `reconcile` reports the
-offending account, the indexed vs on-chain lengths, and the first differing
-byte offset.
+non-zero unless every check is `Pass` — `Fail` and `Skipped` (including
+slot-lag and unreachable fetch) both fail the process, so they can be wired
+into pipeline checks and CI directly. On a byte mismatch, `reconcile`
+reports the offending account, the indexed vs on-chain lengths, and the
+first differing byte offset; lag-tolerated rows add `"reason":"slot lag"`.
 
 The reconciliation client uses a lightweight, rustls-based HTTP client
 (`ureq`) instead of the full `solana-client` stack, so builds stay

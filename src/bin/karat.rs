@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use karat67::checks::reconcile::reconcile;
+use karat67::checks::reconcile::{DEFAULT_MAX_SLOT_LAG, SampleRow, reconcile};
 use karat67::checks::shape::{AccountSpec, KAMINO_ACCOUNTS, check_shape};
 use karat67::fetch::RpcAccountFetcher;
 use karat67::report::{CheckResult, Status};
@@ -33,20 +33,31 @@ enum Command {
     },
     /// Reconcile indexed account bytes against on-chain state: fetch each
     /// account via `getMultipleAccounts` and diff it against the indexed
-    /// bytes. Prints one JSON result per account and exits non-zero unless
-    /// every account passed.
+    /// bytes. Prints one JSON result per account. Exits non-zero unless
+    /// every account is Pass — Fail and Skipped (including slot-lag) both
+    /// fail the process.
     Reconcile {
         /// Solana JSON-RPC endpoint. Falls back to `KARAT_RPC_URL`.
         #[arg(long, env = "KARAT_RPC_URL")]
         rpc_url: String,
         /// Account pubkey to reconcile. Repeatable; paired by position with
-        /// the `--indexed-base64` values.
+        /// the `--indexed-base64` values (and `--indexed-slot` when given).
         #[arg(long = "account", required = true)]
         accounts: Vec<String>,
         /// Base64-encoded indexed bytes for the account at the same position.
         /// Repeatable; must be given once per `--account`.
         #[arg(long = "indexed-base64", required = true)]
         indexed_base64: Vec<String>,
+        /// Slot at which the indexer wrote the account at the same position.
+        /// Optional: omit entirely for strict mismatch=Fail. If any are
+        /// given, the count must match `--account`.
+        #[arg(long = "indexed-slot")]
+        indexed_slots: Vec<u64>,
+        /// Maximum context_slot − indexed_slot lag tolerated on a byte
+        /// mismatch before failing. Within this window a mismatch is
+        /// Skipped (never Pass); the process still exits non-zero.
+        #[arg(long = "max-slot-lag", default_value_t = DEFAULT_MAX_SLOT_LAG)]
+        max_slot_lag: u64,
     },
 }
 
@@ -83,6 +94,8 @@ fn main() -> anyhow::Result<()> {
             rpc_url,
             accounts,
             indexed_base64,
+            indexed_slots,
+            max_slot_lag,
         } => {
             if accounts.len() != indexed_base64.len() {
                 anyhow::bail!(
@@ -92,21 +105,32 @@ fn main() -> anyhow::Result<()> {
                     indexed_base64.len()
                 );
             }
+            if !indexed_slots.is_empty() && indexed_slots.len() != accounts.len() {
+                anyhow::bail!(
+                    "got {} --indexed-slot values but {} --account values; \
+                     supply one slot per account, or omit --indexed-slot entirely",
+                    indexed_slots.len(),
+                    accounts.len()
+                );
+            }
 
-            let mut sample = Vec::with_capacity(accounts.len());
-            for (pubkey, encoded) in accounts.into_iter().zip(indexed_base64) {
+            let mut sample: Vec<SampleRow> = Vec::with_capacity(accounts.len());
+            for (i, (pubkey, encoded)) in accounts.into_iter().zip(indexed_base64).enumerate() {
                 let data = base64::engine::general_purpose::STANDARD
                     .decode(&encoded)
                     .map_err(|e| anyhow::anyhow!("invalid base64 for account {pubkey}: {e}"))?;
-                sample.push((pubkey, data));
+                let indexed_slot = indexed_slots.get(i).copied();
+                sample.push((pubkey, data, indexed_slot));
             }
 
             let fetcher = RpcAccountFetcher::new(rpc_url);
-            let results = reconcile(&sample, &fetcher);
+            let results = reconcile(&sample, &fetcher, max_slot_lag);
 
             for result in &results {
                 println!("{}", serde_json::to_string_pretty(result)?);
             }
+            // Exit 0 only when every result is Pass. Skipped (slot lag or
+            // unreachable fetch) and Fail both fail the process.
             if results
                 .iter()
                 .any(|r: &CheckResult| r.status != Status::Pass)

@@ -23,8 +23,8 @@ pub struct FetchedAccount {
 ///
 /// `accounts` is positional: entry `i` corresponds to the `i`th requested key
 /// and is `None` when the account does not exist on chain. `context_slot` is
-/// the RPC context slot the batch was read at; reconciliation threads it
-/// through so slot-lag tolerance can plug in later.
+/// the RPC context slot the batch was read at; reconciliation uses it for
+/// slot-lag tolerance against each row's optional indexed write slot.
 #[derive(Debug, Clone)]
 pub struct FetchResult {
     pub context_slot: u64,
