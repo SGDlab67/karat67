@@ -21,8 +21,10 @@ CLI that checks indexed data against the chain.
    indexer lag: a mismatch within the window is `Skipped` with a JSON reason
    (`"reason":"slot lag"`), never `Pass`. Beyond the window, or with no write
    slot, a mismatch is still `Fail`.
-3. **Completeness** (planned) - slot coverage compared against `getBlocks`,
-   not a contiguous slot range, because Solana leaders skip slots.
+3. **Completeness** - indexed slot set compared against Solana `getBlocks`
+   for a window, not a contiguous slot range. Leaders skip slots; heights
+   omitted by `getBlocks` are not gaps. Missing = produced slots minus
+   indexed. Catches dropped slots that look healthy under green liveness.
 
 Freshness and liveness are out of scope by design: every indexer already
 has them.
@@ -46,19 +48,31 @@ karat reconcile \
   --indexed-base64 "$INDEXED_BASE64" \
   --indexed-slot "$INDEXED_SLOT" \
   --max-slot-lag 32
+
+# Completeness: compare indexed slots to getBlocks for [start, end].
+# Repeatable --slot and/or a --slots CSV. Skip-slots omitted by getBlocks
+# are not reported as missing.
+karat completeness \
+  --rpc-url https://api.mainnet-beta.solana.com \
+  --start 250000000 \
+  --end 250000100 \
+  --slots 250000000,250000001,250000003 \
+  --slot 250000004
 ```
 
-On a terminal, `shape` prints a readable report; piped (or with `--json`) it
-prints JSON. `reconcile` prints one JSON result per account. Both exit
-non-zero unless every check is `Pass` — `Fail` and `Skipped` (including
-slot-lag and unreachable fetch) both fail the process, so they can be wired
-into pipeline checks and CI directly. On a byte mismatch, `reconcile`
-reports the offending account, the indexed vs on-chain lengths, and the
-first differing byte offset; lag-tolerated rows add `"reason":"slot lag"`.
+On a terminal, `shape` and `completeness` print a readable report; piped (or
+with `--json`) they print JSON. `reconcile` prints one JSON result per
+account. All three exit non-zero unless every check is `Pass` — `Fail` and
+`Skipped` (including slot-lag and unreachable fetch) both fail the process,
+so they can be wired into pipeline checks and CI directly. On a byte
+mismatch, `reconcile` reports the offending account, the indexed vs on-chain
+lengths, and the first differing byte offset; lag-tolerated rows add
+`"reason":"slot lag"`. On a completeness gap, Fail detail lists
+`missing_count` and a `missing_sample` of produced-but-unindexed slots.
 
-The reconciliation client uses a lightweight, rustls-based HTTP client
-(`ureq`) instead of the full `solana-client` stack, so builds stay
-toolchain-only with no OpenSSL system dependency.
+The RPC client uses a lightweight, rustls-based HTTP client (`ureq`) instead
+of the full `solana-client` stack, so builds stay toolchain-only with no
+OpenSSL system dependency.
 
 ## Origin
 

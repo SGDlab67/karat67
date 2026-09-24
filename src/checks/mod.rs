@@ -8,6 +8,7 @@
 //! A new program or account type is new data there, not a new check code path.
 
 pub mod check;
+pub mod completeness;
 pub mod reconcile;
 pub mod shape;
 pub mod specs;

@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
+use karat67::checks::completeness::check_completeness;
 use karat67::checks::reconcile::{DEFAULT_MAX_SLOT_LAG, SampleRow, reconcile};
 use karat67::checks::shape::{AccountSpec, check_shape};
 use karat67::checks::specs::{account_type_names, find_by_account_type};
@@ -59,6 +60,27 @@ enum Command {
         /// Skipped (never Pass); the process still exits non-zero.
         #[arg(long = "max-slot-lag", default_value_t = DEFAULT_MAX_SLOT_LAG)]
         max_slot_lag: u64,
+    },
+    /// Completeness: compare indexed slots to `getBlocks` for a window.
+    /// Leader skip-slots omitted by `getBlocks` are not gaps. Exits non-zero
+    /// unless the result is Pass — Fail and Skipped both fail the process.
+    Completeness {
+        /// Solana JSON-RPC endpoint. Falls back to `KARAT_RPC_URL`.
+        #[arg(long, env = "KARAT_RPC_URL")]
+        rpc_url: String,
+        /// Inclusive start of the slot window to check.
+        #[arg(long)]
+        start: u64,
+        /// Inclusive end of the slot window to check.
+        #[arg(long)]
+        end: u64,
+        /// Indexed slot. Repeatable; combined with `--slots` if both are given.
+        #[arg(long = "slot")]
+        slot: Vec<u64>,
+        /// Comma-separated indexed slots, e.g. `100,101,103`. Combined with
+        /// repeatable `--slot` values.
+        #[arg(long = "slots")]
+        slots: Option<String>,
     },
 }
 
@@ -133,6 +155,48 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Completeness {
+            rpc_url,
+            start,
+            end,
+            slot,
+            slots,
+        } => {
+            if end < start {
+                anyhow::bail!("--end {end} is before --start {start}");
+            }
+
+            let mut indexed = slot;
+            if let Some(csv) = slots {
+                for part in csv.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let value: u64 = part
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("invalid slot in --slots {part:?}: {e}"))?;
+                    indexed.push(value);
+                }
+            }
+            if indexed.is_empty() {
+                anyhow::bail!("provide at least one indexed slot via --slot or --slots");
+            }
+
+            let fetcher = RpcAccountFetcher::new(rpc_url);
+            let result = check_completeness(&indexed, start, end, &fetcher);
+
+            if cli.json || !std::io::stdout().is_terminal() {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print_completeness_human(start, end, indexed.len(), &result);
+            }
+            // Exit 0 only on Pass. Skipped (unreachable fetch) and Fail both
+            // fail the process — same policy as reconcile.
+            if result.status != Status::Pass {
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
 }
@@ -181,6 +245,50 @@ fn print_human(spec: &AccountSpec, len: usize, result: &CheckResult) {
             println!("        liveness and freshness checks cannot see this");
             println!();
             println!("  exit code 1: a pipeline or CI job stops here");
+        }
+    }
+    println!();
+}
+
+/// Terminal report for completeness: window, outcome, skip-slot reminder.
+fn print_completeness_human(start: u64, end: u64, indexed_len: usize, result: &CheckResult) {
+    let color = std::env::var_os("NO_COLOR").is_none();
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
+
+    println!();
+    println!(
+        "  {}  completeness check · slots [{start}..={end}]",
+        paint("1;33", "karat67")
+    );
+    println!();
+    println!("  indexed    {:>6} slot(s) supplied", group(indexed_len));
+    println!();
+    match result.status {
+        Status::Pass => {
+            println!(
+                "  {}  every getBlocks slot in the window is indexed",
+                paint("1;32", "PASS")
+            );
+            println!("        leader skip-slots (omitted by getBlocks) are not gaps");
+        }
+        Status::Fail => {
+            let detail = result.detail.as_deref().unwrap_or("missing slots");
+            println!("  {}  {detail}", paint("1;31", "FAIL"));
+            println!("        produced slots from getBlocks are absent from the index");
+            println!();
+            println!("  exit code 1: a pipeline or CI job stops here");
+        }
+        Status::Skipped => {
+            let detail = result.detail.as_deref().unwrap_or("check skipped");
+            println!("  {}  {detail}", paint("1;33", "SKIP"));
+            println!();
+            println!("  exit code 1: Skipped is never green");
         }
     }
     println!();

@@ -1,9 +1,10 @@
-//! Account fetching, modeled on Solana's `getMultipleAccounts` RPC.
+//! Account and slot-coverage fetching, modeled on Solana JSON-RPC.
 //!
 //! Reconciliation reads on-chain state through the [`AccountFetcher`] seam so
 //! the diffing logic stays offline-testable: tests drive it with
 //! [`MockFetcher`], while the CLI drives it with [`RpcAccountFetcher`] against
-//! a real endpoint.
+//! a real endpoint. Completeness uses the same structs via
+//! [`SlotCoverageFetcher`] (`getBlocks`).
 
 use std::collections::HashMap;
 
@@ -42,7 +43,20 @@ pub trait AccountFetcher {
     fn get_multiple_accounts(&self, keys: &[String]) -> anyhow::Result<FetchResult>;
 }
 
-/// In-memory [`AccountFetcher`] with canned data for hermetic tests.
+/// Fetches confirmed block slots in a range, like Solana's `getBlocks`.
+///
+/// Leaders skip slots: those heights never produce a block and are omitted
+/// from the result. Completeness treats omitted skip-slots as non-gaps — only
+/// slots that `getBlocks` returns are expected to appear in the index.
+pub trait SlotCoverageFetcher {
+    /// Confirmed block slots in the inclusive range `[start, end]`.
+    ///
+    /// An `Err` means the fetch itself was unreachable (network, RPC error).
+    fn get_blocks(&self, start: u64, end: u64) -> anyhow::Result<Vec<u64>>;
+}
+
+/// In-memory [`AccountFetcher`] / [`SlotCoverageFetcher`] with canned data for
+/// hermetic tests.
 ///
 /// A normal (non-`cfg(test)`) struct so it can back examples and integration
 /// tests too. Unknown keys resolve to `None` (missing on chain); construct
@@ -50,6 +64,9 @@ pub trait AccountFetcher {
 pub struct MockFetcher {
     context_slot: u64,
     accounts: HashMap<String, FetchedAccount>,
+    /// Confirmed block slots returned by [`SlotCoverageFetcher::get_blocks`].
+    /// Slots outside the requested window are filtered out.
+    blocks: Vec<u64>,
     unreachable: bool,
 }
 
@@ -59,6 +76,7 @@ impl MockFetcher {
         Self {
             context_slot,
             accounts: HashMap::new(),
+            blocks: Vec::new(),
             unreachable: false,
         }
     }
@@ -68,6 +86,7 @@ impl MockFetcher {
         Self {
             context_slot: 0,
             accounts: HashMap::new(),
+            blocks: Vec::new(),
             unreachable: true,
         }
     }
@@ -76,6 +95,14 @@ impl MockFetcher {
     pub fn with_account(mut self, key: impl Into<String>, data: Vec<u8>, slot: u64) -> Self {
         self.accounts
             .insert(key.into(), FetchedAccount { data, slot });
+        self
+    }
+
+    /// Register confirmed block slots for [`SlotCoverageFetcher::get_blocks`].
+    ///
+    /// Omit leader skip-slots here the same way real `getBlocks` omits them.
+    pub fn with_blocks(mut self, blocks: impl IntoIterator<Item = u64>) -> Self {
+        self.blocks.extend(blocks);
         self
     }
 }
@@ -93,6 +120,23 @@ impl AccountFetcher for MockFetcher {
             context_slot: self.context_slot,
             accounts,
         })
+    }
+}
+
+impl SlotCoverageFetcher for MockFetcher {
+    fn get_blocks(&self, start: u64, end: u64) -> anyhow::Result<Vec<u64>> {
+        if self.unreachable {
+            anyhow::bail!("mock fetcher is unreachable");
+        }
+        let mut slots: Vec<u64> = self
+            .blocks
+            .iter()
+            .copied()
+            .filter(|&slot| slot >= start && slot <= end)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        Ok(slots)
     }
 }
 
@@ -161,6 +205,49 @@ impl AccountFetcher for RpcAccountFetcher {
             context_slot,
             accounts,
         })
+    }
+}
+
+impl SlotCoverageFetcher for RpcAccountFetcher {
+    fn get_blocks(&self, start: u64, end: u64) -> anyhow::Result<Vec<u64>> {
+        if end < start {
+            anyhow::bail!("getBlocks end slot {end} is before start slot {start}");
+        }
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBlocks",
+            "params": [start, end],
+        });
+
+        let mut response = self
+            .agent
+            .post(&self.endpoint)
+            .send_json(&request)
+            .map_err(|e| anyhow::anyhow!("getBlocks request failed: {e}"))?;
+        let body: serde_json::Value = response
+            .body_mut()
+            .read_json()
+            .map_err(|e| anyhow::anyhow!("reading getBlocks response failed: {e}"))?;
+
+        if let Some(error) = body.get("error") {
+            anyhow::bail!("RPC returned an error: {error}");
+        }
+
+        let values = body
+            .get("result")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("RPC response missing `result` array"))?;
+
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("getBlocks entry is not a u64: {value}"))
+            })
+            .collect()
     }
 }
 
@@ -244,5 +331,18 @@ mod tests {
         assert!(result.accounts[0].is_some());
         assert!(result.accounts[1].is_none());
         assert!(result.accounts[2].is_some());
+    }
+
+    #[test]
+    fn mock_get_blocks_filters_to_window() {
+        let fetcher = MockFetcher::new(0).with_blocks([98, 100, 101, 105, 110]);
+        let blocks = fetcher.get_blocks(100, 105).expect("reachable");
+        assert_eq!(blocks, vec![100, 101, 105]);
+    }
+
+    #[test]
+    fn mock_get_blocks_unreachable_errors() {
+        let fetcher = MockFetcher::unreachable();
+        assert!(fetcher.get_blocks(1, 10).is_err());
     }
 }
