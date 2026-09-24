@@ -5,5 +5,6 @@
 //! has them.
 
 pub mod check;
+pub mod completeness;
 pub mod reconcile;
 pub mod shape;
