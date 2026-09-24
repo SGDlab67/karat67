@@ -3,7 +3,8 @@ use std::io::IsTerminal;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use karat67::checks::reconcile::{DEFAULT_MAX_SLOT_LAG, SampleRow, reconcile};
-use karat67::checks::shape::{AccountSpec, KAMINO_ACCOUNTS, check_shape};
+use karat67::checks::shape::{AccountSpec, check_shape};
+use karat67::checks::specs::{account_type_names, find_by_account_type};
 use karat67::fetch::RpcAccountFetcher;
 use karat67::report::{CheckResult, Status};
 
@@ -65,16 +66,10 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Shape { account_type, len } => {
-            let Some(spec) = KAMINO_ACCOUNTS
-                .iter()
-                .find(|spec| spec.account_type == account_type)
-            else {
+            let Some(spec) = find_by_account_type(&account_type) else {
                 anyhow::bail!(
                     "unknown account type {account_type:?}, expected one of {:?}",
-                    KAMINO_ACCOUNTS
-                        .iter()
-                        .map(|spec| spec.account_type)
-                        .collect::<Vec<_>>()
+                    account_type_names()
                 );
             };
 
