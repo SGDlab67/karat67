@@ -11,6 +11,7 @@
 //!
 //! Early development. The API is unstable.
 
+pub mod carbon;
 pub mod checks;
 pub mod fetch;
 pub mod report;
