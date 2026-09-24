@@ -6,44 +6,26 @@
 //! green. The chain does not produce empty, truncated, over-long, or
 //! unknown-discriminator data for allocated accounts, so this failure class
 //! is detectable without any threshold.
+//!
+//! Account layouts live in [`crate::checks::specs`] — the single IDL-informed
+//! registry. This module never hard-codes per-type sizes or discriminators;
+//! adding a type is a new [`AccountSpec`] row, not a new match arm here.
 
 use crate::checks::check::Check;
+use crate::checks::specs::find_by_discriminator;
 use crate::report::CheckResult;
 
-/// IDL-declared shape of one account type: its 8-byte Anchor discriminator
-/// and its exact borsh-encoded size (discriminator included).
-#[derive(Debug, Clone, Copy)]
-pub struct AccountSpec {
-    pub account_type: &'static str,
-    pub discriminator: [u8; 8],
-    pub data_len: usize,
-}
+// Re-export registry types callers historically imported from this module.
+pub use crate::checks::specs::{AccountSpec, KAMINO_ACCOUNTS};
 
-/// Kamino Lending account specs, verified against the program's IDL-derived
-/// decoders (discriminator and exact borsh-encoded size).
-pub const KAMINO_ACCOUNTS: &[AccountSpec] = &[
-    AccountSpec {
-        account_type: "Obligation",
-        discriminator: [168, 206, 141, 106, 88, 76, 172, 167],
-        data_len: 3344,
-    },
-    AccountSpec {
-        account_type: "UserMetadata",
-        discriminator: [157, 214, 220, 235, 98, 135, 171, 28],
-        data_len: 1032,
-    },
-    AccountSpec {
-        account_type: "Reserve",
-        discriminator: [43, 242, 204, 202, 26, 247, 59, 127],
-        data_len: 8624,
-    },
-];
-
-/// Check an observed account payload against the Kamino account registry.
+/// Check an observed account payload against the account registry.
 ///
 /// Fails on: empty or too-short data (under 8 bytes), an unknown
 /// discriminator, or a length that does not exactly match the matched
 /// account type's IDL-declared size (truncated or over-long).
+///
+/// All type-specific knowledge comes from [`KAMINO_ACCOUNTS`]; there is no
+/// per-account match arm in this function.
 pub fn check_shape(data: &[u8]) -> CheckResult {
     if data.len() < 8 {
         let what = if data.is_empty() {
@@ -61,10 +43,7 @@ pub fn check_shape(data: &[u8]) -> CheckResult {
     }
 
     let discriminator: [u8; 8] = data[..8].try_into().expect("checked len >= 8 above");
-    let Some(spec) = KAMINO_ACCOUNTS
-        .iter()
-        .find(|spec| spec.discriminator == discriminator)
-    else {
+    let Some(spec) = find_by_discriminator(discriminator) else {
         return CheckResult::fail("shape", format!("unknown discriminator: {discriminator:?}"));
     };
 
@@ -114,10 +93,7 @@ impl Check for ShapeCheck<'_> {
         // type when the discriminator is known, else the bare `shape`.
         if self.data.len() >= 8 {
             let discriminator: [u8; 8] = self.data[..8].try_into().expect("checked len >= 8");
-            if let Some(spec) = KAMINO_ACCOUNTS
-                .iter()
-                .find(|spec| spec.discriminator == discriminator)
-            {
+            if let Some(spec) = find_by_discriminator(discriminator) {
                 return format!("shape({})", spec.account_type);
             }
         }
@@ -132,6 +108,7 @@ impl Check for ShapeCheck<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checks::specs::find_by_account_type;
     use crate::report::Status;
 
     const OBLIGATION_DISCRIMINATOR: [u8; 8] = [168, 206, 141, 106, 88, 76, 172, 167];
@@ -213,5 +190,36 @@ mod tests {
     fn check_trait_name_falls_back_for_unknown_discriminator() {
         let data = buffer_with_discriminator([0, 1, 2, 3, 4, 5, 6, 7], OBLIGATION_LEN);
         assert_eq!(ShapeCheck::new(&data).name(), "shape");
+    }
+
+    /// Lock: every registry entry — including types added as data only —
+    /// is accepted by `check_shape` with no per-type logic in that function.
+    #[test]
+    fn adding_spec_is_data_only() {
+        assert!(
+            KAMINO_ACCOUNTS.len() >= 4,
+            "registry must include LendingMarket as a fourth data-only entry"
+        );
+        assert!(
+            find_by_account_type("LendingMarket").is_some(),
+            "LendingMarket must be discoverable by name from the registry alone"
+        );
+
+        for spec in KAMINO_ACCOUNTS {
+            let data = buffer_with_discriminator(spec.discriminator, spec.data_len);
+            let result = check_shape(&data);
+            assert_eq!(
+                result.status,
+                Status::Pass,
+                "{} at {} bytes should pass via registry lookup only",
+                spec.account_type,
+                spec.data_len
+            );
+            assert_eq!(result.check, format!("shape({})", spec.account_type));
+            assert_eq!(
+                ShapeCheck::new(&data).name(),
+                format!("shape({})", spec.account_type)
+            );
+        }
     }
 }

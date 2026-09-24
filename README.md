@@ -10,6 +10,8 @@ CLI that checks indexed data against the chain.
 ## Checks
 
 1. **Shape** - account data length and discriminator against the program IDL.
+   Layouts live in a single `AccountSpec` registry (`checks::specs`): a new
+   account type is one data row, not a new size/discriminator code path.
    Catches the failure class where rows arrive empty while every liveness
    signal stays green.
 2. **Reconciliation** - sample N indexed accounts, fetch them via
@@ -69,7 +71,9 @@ this lesson the same way.
 
 ## Roadmap
 
-- IDL-driven check trait: a new program costs zero code.
+- IDL-driven account specs (done for Kamino Lend): new account types are
+  `AccountSpec` data; the `Check` trait is the uniform seam. Broader
+  multi-program IDL ingest still to come.
 - Carbon integration: integrity checks as a processor, results emitted
   through the existing metrics layer.
 - MCP wrapper so agents can ask whether the indexer behind their data is

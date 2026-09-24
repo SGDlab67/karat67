@@ -2,9 +2,13 @@
 //!
 //! Reconciliation and completeness reuse the same `CheckResult` contract as
 //! shape, so the CLI and any future Carbon processor can run checks without
-//! knowing which one they hold. The roadmap's "IDL-driven check trait: a new
-//! program costs zero code" is this seam: adding a program means adding data
-//! (an `AccountSpec`), not a new code path.
+//! knowing which one they hold.
+//!
+//! The IDL-driven lock is: a new program (or account type) costs zero check
+//! code. Add [`AccountSpec`](crate::checks::specs::AccountSpec) rows to the
+//! registry in [`crate::checks::specs`]; [`crate::checks::shape::check_shape`]
+//! and [`ShapeCheck`](crate::checks::shape::ShapeCheck) already consult that
+//! table. The trait stays the uniform seam; the specs are the data.
 
 use crate::report::CheckResult;
 
