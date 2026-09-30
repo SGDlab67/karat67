@@ -6,7 +6,8 @@ use karat67::checks::completeness::check_completeness;
 use karat67::checks::reconcile::{DEFAULT_MAX_SLOT_LAG, SampleRow, reconcile};
 use karat67::checks::shape::{AccountSpec, check_shape};
 use karat67::checks::specs::{account_type_names, find_by_account_type};
-use karat67::fetch::RpcAccountFetcher;
+use karat67::fetch::{AccountFetcher, RpcAccountFetcher};
+use karat67::gate::{all_pass, check_account};
 use karat67::report::{CheckResult, Status};
 
 /// Integrity checks for Solana indexers: verify indexed data is correct,
@@ -81,6 +82,31 @@ enum Command {
         /// repeatable `--slot` values.
         #[arg(long = "slots")]
         slots: Option<String>,
+    },
+    /// Shape-check one account's real indexed bytes, then reconcile that
+    /// account against RPC only if shape passes. Prints JSON results. Exits
+    /// 0 only when every result is Pass. A shape failure does not call RPC.
+    Account {
+        /// Account pubkey.
+        #[arg(long)]
+        account: String,
+        /// Base64-encoded indexed account bytes. These exact bytes are shaped
+        /// and reconciled — not a reconstructed discriminator.
+        #[arg(long)]
+        indexed_base64: String,
+        /// Slot at which the indexer wrote this account. Omit for strict
+        /// mismatch = Fail.
+        #[arg(long)]
+        indexed_slot: Option<u64>,
+        /// Maximum context_slot − indexed_slot lag tolerated on a byte
+        /// mismatch before failing. Within this window a mismatch is
+        /// Skipped (never Pass).
+        #[arg(long = "max-slot-lag", default_value_t = DEFAULT_MAX_SLOT_LAG)]
+        max_slot_lag: u64,
+        /// Solana JSON-RPC endpoint. Falls back to `KARAT_RPC_URL`. Required
+        /// only after shape passes; unused when shape fails.
+        #[arg(long, env = "KARAT_RPC_URL")]
+        rpc_url: Option<String>,
     },
 }
 
@@ -194,6 +220,31 @@ fn main() -> anyhow::Result<()> {
             // Exit 0 only on Pass. Skipped (unreachable fetch) and Fail both
             // fail the process — same policy as reconcile.
             if result.status != Status::Pass {
+                std::process::exit(1);
+            }
+        }
+        Command::Account {
+            account,
+            indexed_base64,
+            indexed_slot,
+            max_slot_lag,
+            rpc_url,
+        } => {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(indexed_base64.trim())
+                .map_err(|e| anyhow::anyhow!("invalid base64 for account {account}: {e}"))?;
+            let fetcher = rpc_url.map(RpcAccountFetcher::new);
+            let results = check_account(
+                &account,
+                &data,
+                indexed_slot,
+                max_slot_lag,
+                fetcher.as_ref().map(|fetch| fetch as &dyn AccountFetcher),
+            );
+            for result in &results {
+                println!("{}", serde_json::to_string_pretty(result)?);
+            }
+            if !all_pass(&results) {
                 std::process::exit(1);
             }
         }

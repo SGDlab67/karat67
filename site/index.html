@@ -110,6 +110,21 @@
             </ul>
           </article>
           <article class="card">
+            <h3><code>karat account</code></h3>
+            <p>
+              One account, real indexed bytes: shape those exact bytes, then
+              reconcile against RPC only if shape passes. Exit 0 only when
+              every result is Pass. A shape failure does not call RPC.
+            </p>
+            <ul class="flags">
+              <li><code>--account &lt;PUBKEY&gt;</code></li>
+              <li><code>--indexed-base64 &lt;BYTES&gt;</code></li>
+              <li><code>--indexed-slot &lt;SLOT&gt;</code> (optional)</li>
+              <li><code>--max-slot-lag &lt;MAX_SLOT_LAG&gt;</code> (default 32)</li>
+              <li><code>--rpc-url &lt;RPC_URL&gt;</code> (env: <code>KARAT_RPC_URL</code>)</li>
+            </ul>
+          </article>
+          <article class="card">
             <h3><code>karat completeness</code></h3>
             <p>
               Compare indexed slots to <code>getBlocks</code> for a window.

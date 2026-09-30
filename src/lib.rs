@@ -14,4 +14,5 @@
 pub mod carbon;
 pub mod checks;
 pub mod fetch;
+pub mod gate;
 pub mod report;

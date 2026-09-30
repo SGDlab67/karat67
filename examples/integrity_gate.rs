@@ -20,11 +20,36 @@ fn main() {
 
     // Every payload a decode path can hand the gate, and what it should do.
     let cases: [(&str, &str, Vec<u8>, Status); 5] = [
-        ("well-formed row", "Obligation", obligation.clone(), Status::Pass),
-        ("empty payload (the 158.91-hour failure)", "Obligation", vec![], Status::Fail),
-        ("truncated row", "Obligation", obligation[..3000].to_vec(), Status::Fail),
-        ("over-long row", "Obligation", [obligation.clone(), vec![0; 16]].concat(), Status::Fail),
-        ("foreign discriminator", "Obligation", vec![7; 3344], Status::Fail),
+        (
+            "well-formed row",
+            "Obligation",
+            obligation.clone(),
+            Status::Pass,
+        ),
+        (
+            "empty payload (the 158.91-hour failure)",
+            "Obligation",
+            vec![],
+            Status::Fail,
+        ),
+        (
+            "truncated row",
+            "Obligation",
+            obligation[..3000].to_vec(),
+            Status::Fail,
+        ),
+        (
+            "over-long row",
+            "Obligation",
+            [obligation.clone(), vec![0; 16]].concat(),
+            Status::Fail,
+        ),
+        (
+            "foreign discriminator",
+            "Obligation",
+            vec![7; 3344],
+            Status::Fail,
+        ),
     ];
 
     let mut wrong = 0;

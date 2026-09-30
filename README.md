@@ -49,6 +49,18 @@ karat reconcile \
   --indexed-slot "$INDEXED_SLOT" \
   --max-slot-lag 32
 
+# One account, real indexed bytes: shape those exact bytes, and only if
+# that is Pass reconcile the same account. Same slot-lag rules as reconcile
+# (default max lag 32; no --indexed-slot means a mismatch is Fail). A shape
+# failure prints that result and does not call RPC. Exit 0 only when every
+# result is Pass.
+karat account \
+  --account So11111111111111111111111111111111111111112 \
+  --indexed-base64 "$INDEXED_BASE64" \
+  --indexed-slot "$INDEXED_SLOT" \
+  --max-slot-lag 32 \
+  --rpc-url https://api.mainnet-beta.solana.com
+
 # Completeness: compare indexed slots to getBlocks for [start, end].
 # Repeatable --slot and/or a --slots CSV. Skip-slots omitted by getBlocks
 # are not reported as missing.
@@ -61,9 +73,12 @@ karat completeness \
 ```
 
 On a terminal, `shape` and `completeness` print a readable report; piped (or
-with `--json`) they print JSON. `reconcile` prints one JSON result per
-account. All three exit non-zero unless every check is `Pass` — `Fail` and
-`Skipped` (including slot-lag and unreachable fetch) both fail the process,
+with `--json`) they print JSON. `reconcile` and `account` print JSON
+results (one object per check). `account` runs shape on the decoded bytes
+and, only when that is Pass, the reconcile check for that account — both
+objects are printed when reconcile runs. All of these exit non-zero unless
+every check is `Pass`. `Fail` and `Skipped` (including slot-lag and unreachable
+fetch) both fail the process,
 so they can be wired into pipeline checks and CI directly. On a byte
 mismatch, `reconcile` reports the offending account, the indexed vs on-chain
 lengths, and the first differing byte offset; lag-tolerated rows add
