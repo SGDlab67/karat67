@@ -1,0 +1,22 @@
+# Copy this file to .github/workflows/shape-check.yml to run an offline
+# integrity shape check in GitHub Actions (no RPC, no secrets).
+#
+# Example:
+#   cp .github/workflows/shape-check.example.yml .github/workflows/shape-check.yml
+#
+# Live RPC checks (reconcile, completeness) stay opt-in via KARAT_RPC_URL or
+# --rpc-url and are intentionally omitted here.
+
+name: Shape check (offline example)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  shape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Shape check (Kamino UserMetadata, no RPC)
+        run: cargo run --release --bin karat -- shape --account-type UserMetadata --len 1032

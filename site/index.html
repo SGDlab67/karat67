@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>karat67 — indexer integrity, not just liveness</title>
+    <meta
+      name="description"
+      content="Verify Solana indexer data is correct, not just flowing: shape, reconcile, completeness."
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <p class="eyebrow">Solana indexer integrity</p>
+      <h1>karat67</h1>
+      <p class="lede">
+        Green liveness only proves the pipeline is moving; chain-truth checks
+        ask whether indexed bytes match the program IDL, on-chain state, and
+        produced slots.
+      </p>
+      <p class="repo">
+        <a href="https://github.com/SGDlab67/karat67">github.com/SGDlab67/karat67</a>
+      </p>
+    </header>
+
+    <main>
+      <section aria-labelledby="flow-heading">
+        <h2 id="flow-heading">Integrity flow</h2>
+        <p class="section-note">
+          Wire checks after decode in your indexer pipeline. Exit&nbsp;0 only if
+          every step is <span class="status pass">Pass</span>.
+        </p>
+        <ol class="flow" id="integrity-flow">
+          <li class="flow-step" data-step="indexer">
+            <span class="flow-label">Indexer</span>
+            <span class="flow-desc">Decoded accounts &amp; slot writes</span>
+          </li>
+          <li class="flow-arrow" aria-hidden="true">→</li>
+          <li class="flow-step" data-step="shape">
+            <span class="flow-label">Shape</span>
+            <span class="flow-desc">IDL length &amp; discriminator</span>
+            <span class="flow-status pass">Pass</span>
+          </li>
+          <li class="flow-arrow" aria-hidden="true">→</li>
+          <li class="flow-step" data-step="reconcile">
+            <span class="flow-label">Reconcile</span>
+            <span class="flow-desc">Bytes vs chain (slot-lag window)</span>
+            <span class="flow-status pass">Pass</span>
+          </li>
+          <li class="flow-arrow" aria-hidden="true">→</li>
+          <li class="flow-step" data-step="completeness">
+            <span class="flow-label">Completeness</span>
+            <span class="flow-desc">Indexed slots vs <code>getBlocks</code></span>
+            <span class="flow-status pass">Pass</span>
+          </li>
+          <li class="flow-arrow" aria-hidden="true">→</li>
+          <li class="flow-step flow-exit" data-step="exit">
+            <span class="flow-label">Process exit</span>
+            <span class="flow-desc"><code>0</code> iff all Pass</span>
+          </li>
+        </ol>
+      </section>
+
+      <section aria-labelledby="origin-heading">
+        <h2 id="origin-heading">Why this exists</h2>
+        <p>
+          A Kamino Lend indexer ingested empty payloads for
+          <code>Obligation</code> and <code>UserMetadata</code> accounts for
+          <strong>158.91 hours</strong> while every liveness signal stayed
+          green: checkpoints advanced, freshness looked fine, rows kept
+          arriving. Nothing asked whether the data had the right shape.
+        </p>
+      </section>
+
+      <section aria-labelledby="cli-heading">
+        <h2 id="cli-heading">CLI checks</h2>
+        <p class="section-note">
+          Flags below match <code>karat --help</code> and subcommand help on
+          this repo.
+        </p>
+        <div class="cards">
+          <article class="card">
+            <h3><code>karat shape</code></h3>
+            <p>
+              Check an observed account payload against the Kamino account
+              registry, by discriminator and exact size.
+            </p>
+            <ul class="flags">
+              <li><code>--account-type &lt;ACCOUNT_TYPE&gt;</code></li>
+              <li><code>--len &lt;LEN&gt;</code></li>
+              <li><code>--json</code> (global)</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3><code>karat reconcile</code></h3>
+            <p>
+              Diff indexed bytes against on-chain state via
+              <code>getMultipleAccounts</code>. Exits non-zero unless every
+              account is Pass — Fail and Skipped (including slot-lag) both fail
+              the process.
+            </p>
+            <ul class="flags">
+              <li><code>--rpc-url &lt;RPC_URL&gt;</code> (env: <code>KARAT_RPC_URL</code>)</li>
+              <li><code>--account &lt;ACCOUNTS&gt;</code> (repeatable)</li>
+              <li><code>--indexed-base64 &lt;INDEXED_BASE64&gt;</code> (repeatable)</li>
+              <li><code>--indexed-slot &lt;INDEXED_SLOTS&gt;</code> (optional)</li>
+              <li><code>--max-slot-lag &lt;MAX_SLOT_LAG&gt;</code> (default 32)</li>
+              <li><code>--json</code> (global)</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3><code>karat completeness</code></h3>
+            <p>
+              Compare indexed slots to <code>getBlocks</code> for a window.
+              Leader skip-slots omitted by <code>getBlocks</code> are not gaps.
+            </p>
+            <ul class="flags">
+              <li><code>--rpc-url &lt;RPC_URL&gt;</code> (env: <code>KARAT_RPC_URL</code>)</li>
+              <li><code>--start &lt;START&gt;</code></li>
+              <li><code>--end &lt;END&gt;</code></li>
+              <li><code>--slot &lt;SLOT&gt;</code> (repeatable)</li>
+              <li><code>--slots &lt;SLOTS&gt;</code> (comma-separated)</li>
+              <li><code>--json</code> (global)</li>
+            </ul>
+          </article>
+        </div>
+        <p class="global-flags">
+          Global: <code>--json</code>, <code>-h</code> / <code>--help</code>,
+          <code>-V</code> / <code>--version</code>
+        </p>
+      </section>
+
+      <section aria-labelledby="deploy-heading">
+        <h2 id="deploy-heading">Deploy &amp; CI</h2>
+        <p>
+          Default CI runs <code>cargo fmt</code>, <code>cargo clippy -D warnings</code>,
+          and <code>cargo test --all</code> — no RPC. Live checks stay opt-in via
+          <code>KARAT_RPC_URL</code> or <code>--rpc-url</code>.
+        </p>
+        <p>
+          <strong>GitHub Pages (one-time):</strong> in the repo go to
+          <em>Settings → Pages</em>, set <strong>Source</strong> to
+          <strong>GitHub Actions</strong>. Pushes to <code>main</code> run
+          <code>.github/workflows/pages.yml</code> and publish the
+          <code>site/</code> folder.
+        </p>
+        <p>Copy this workflow to run an offline shape check without a local Rust install:</p>
+        <div class="copy-block">
+          <button type="button" class="copy-btn" data-copy="shape-workflow">
+            Copy workflow
+          </button>
+          <pre id="shape-workflow"><code>name: Shape check (offline)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Offline shape check (no RPC)
+        run: cargo run --release --bin karat -- shape --account-type UserMetadata --len 1032</code></pre>
+        </div>
+        <p class="hint">
+          Or start from
+          <code>.github/workflows/shape-check.example.yml</code> in the repo
+          (<code>workflow_dispatch</code> only; no RPC).
+        </p>
+      </section>
+    </main>
+
+    <footer>
+      <p>MIT · Colosseum Crypto World&apos;s Fair 2026</p>
+    </footer>
+    <script src="main.js"></script>
+  </body>
+</html>
