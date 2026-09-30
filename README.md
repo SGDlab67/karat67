@@ -78,8 +78,8 @@ results (one object per check). `account` runs shape on the decoded bytes
 and, only when that is Pass, the reconcile check for that account — both
 objects are printed when reconcile runs. All of these exit non-zero unless
 every check is `Pass`. `Fail` and `Skipped` (including slot-lag and unreachable
-fetch) both fail the process,
-so they can be wired into pipeline checks and CI directly. On a byte
+fetch) both fail the process, so they can be wired into pipeline checks and CI
+directly. On a byte
 mismatch, `reconcile` reports the offending account, the indexed vs on-chain
 lengths, and the first differing byte offset; lag-tolerated rows add
 `"reason":"slot lag"`. On a completeness gap, Fail detail lists
@@ -102,10 +102,33 @@ this lesson the same way.
 ## Carbon integration
 
 Wire [`KaratIntegrityProcessor`](src/carbon.rs) as a processor **after** account
-decode in a [Carbon](https://github.com/sevenlabs-hq/carbon) pipeline: call
-`check_account(account_type, data)` on the decoded type name and raw bytes.
-No Carbon crate dependency — drop-in from any decode path. An MCP wrapper so
-agents can query integrity status is planned later.
+decode in a [Carbon](https://github.com/sevenlabs-hq/carbon) pipeline. No Carbon
+crate dependency — drop-in from any decode path.
+
+- `check_account(account_type, data)` is the shape check on the raw bytes.
+- `gate_account(account, data, indexed_slot, max_slot_lag, fetcher)` is the
+  same gate as `karat account`: shape those exact bytes, then reconcile only
+  if that is Pass. `examples/account_gate.rs` is the call sequence, not an
+  indexer (`cargo run --example account_gate`).
+
+## MCP
+
+`karat-mcp` is a stdio JSON-RPC server (`initialize`, `tools/list`,
+`tools/call`) with one tool, `check_account`. Arguments match `karat account`:
+`account`, `indexed_base64`, optional `indexed_slot`, `max_slot_lag` (default
+32), and `rpc_url` (or `KARAT_RPC_URL`). Shape runs first; reconcile runs only
+after Pass, so a bad payload never calls RPC.
+
+The tool text is JSON `{ "ok": bool, "results": [...] }`. `ok` is true only
+when every result is Pass — the same rule as the CLI exit code. `isError` is
+the inverse of `ok`.
+
+Send one JSON object per line, or a `Content-Length` frame. Replies are
+`Content-Length` frames.
+
+```bash
+cargo run --quiet --bin karat-mcp
+```
 
 ## Roadmap
 
@@ -113,8 +136,8 @@ agents can query integrity status is planned later.
   `AccountSpec` data; the `Check` trait is the uniform seam. Broader
   multi-program IDL ingest still to come.
 - Carbon metrics emission for processor results.
-- MCP wrapper so agents can ask whether the indexer behind their data is
-  passing integrity checks before acting on it.
+- MCP stdio tool `check_account` (`karat-mcp`) calls the account gate. Broader
+  agent workflows on top of it still to come.
 
 Designed to plug into [Carbon](https://github.com/sevenlabs-hq/carbon)
 pipelines without rewriting the indexer.

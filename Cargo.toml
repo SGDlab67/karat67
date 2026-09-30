@@ -23,3 +23,7 @@ ureq = { version = "3", features = ["json"] }
 [[bin]]
 name = "karat"
 path = "src/bin/karat.rs"
+
+[[bin]]
+name = "karat-mcp"
+path = "src/bin/karat-mcp.rs"

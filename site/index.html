@@ -154,6 +154,12 @@
           <code>KARAT_RPC_URL</code> or <code>--rpc-url</code>.
         </p>
         <p>
+          <code>karat account</code> is the one-account gate (shape, then
+          reconcile). Agents call the same gate with <code>karat-mcp</code>,
+          method <code>check_account</code>. <code>ok</code> is true only when
+          every result is Pass.
+        </p>
+        <p>
           <strong>GitHub Pages (one-time):</strong> in the repo go to
           <em>Settings → Pages</em>, set <strong>Source</strong> to
           <strong>GitHub Actions</strong>. Pushes to <code>main</code> run
