@@ -1,5 +1,8 @@
 # karat67
 
+![CI](https://github.com/SGDlab67/karat67/actions/workflows/ci.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+
 **Verify that Solana indexer data is correct, not just flowing.**
 
 An indexer can pass every freshness and throughput check while writing empty
@@ -89,6 +92,17 @@ The RPC client uses a lightweight, rustls-based HTTP client (`ureq`) instead
 of the full `solana-client` stack, so builds stay toolchain-only with no
 OpenSSL system dependency.
 
+## Run it in CI
+
+Offline, no RPC, no secrets: copy
+[`.github/workflows/karat-check.yml`](.github/workflows/karat-check.yml) into
+your repository and point `--account-type` and `--len` at an observed indexer
+row. An empty or malformed payload fails the job with exit code 1, so a bad
+row stops the pipeline instead of landing in the warehouse.
+
+Reconcile and completeness call a live RPC. Keep those opt-in behind
+`KARAT_RPC_URL` rather than in default CI.
+
 ## Origin
 
 A Kamino Lend indexer ingested empty payloads for `Obligation` and
@@ -133,11 +147,11 @@ cargo run --quiet --bin karat-mcp
 ## Roadmap
 
 - IDL-driven account specs (done for Kamino Lend): new account types are
-  `AccountSpec` data; the `Check` trait is the uniform seam. Broader
-  multi-program IDL ingest still to come.
+  `AccountSpec` data and the `Check` trait is the uniform seam. A second
+  program still means a new spec table, so broader multi-program IDL ingest
+  is the next real step.
 - Carbon metrics emission for processor results.
-- MCP stdio tool `check_account` (`karat-mcp`) calls the account gate. Broader
-  agent workflows on top of it still to come.
+- Broader agent workflows on top of the shipped `check_account` MCP tool.
 
 Designed to plug into [Carbon](https://github.com/sevenlabs-hq/carbon)
 pipelines without rewriting the indexer.
