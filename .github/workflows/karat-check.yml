@@ -1,0 +1,57 @@
+# Offline shape check. No secrets. Live RPC is not a job in this file.
+#
+# Use this workflow in the repository that should run karat: commit it at
+# .github/workflows/karat-check.yml. Actions installs the Rust toolchain and
+# checks out karat67, so a laptop does not need Rust.
+#
+# The command below is a known-good shape check (Kamino UserMetadata, 1032
+# bytes). Point --account-type and --len at an observed indexer row to gate
+# that row. An empty payload fails the process, for example:
+#   karat shape --account-type Obligation --len 0
+#
+# Reconcile and completeness call a live RPC. They stay opt-in via
+# KARAT_RPC_URL and are not steps here, so default CI does not hit the chain.
+# Flags match `karat --help`.
+#
+#   karat reconcile \
+#     --rpc-url "$KARAT_RPC_URL" \
+#     --account <PUBKEY> \
+#     --indexed-base64 <BASE64> \
+#     --indexed-slot <SLOT> \
+#     --max-slot-lag 32 \
+#     --json
+#   Within --max-slot-lag (default 32) a byte mismatch is Skipped, never Pass.
+#   Fail and Skipped both exit non-zero.
+#
+#   karat completeness \
+#     --rpc-url "$KARAT_RPC_URL" \
+#     --start <START> \
+#     --end <END> \
+#     --slot <SLOT> \
+#     --slots <CSV> \
+#     --json
+#   --start and --end are an inclusive slot window. Skip-slots omitted by
+#   getBlocks are not gaps.
+
+name: karat check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout karat67
+        uses: actions/checkout@v4
+        with:
+          repository: SGDlab67/karat67
+          ref: main
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Shape check (offline, no RPC)
+        run: cargo run --locked --bin karat -- shape --account-type UserMetadata --len 1032
