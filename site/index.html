@@ -3,154 +3,366 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>karat67 — prove indexer data matches the chain</title>
+    <title>karat67, prove the indexed bytes are right</title>
     <meta
       name="description"
-      content="Chain-truth CI for Solana indexers: shape, reconcile, completeness. Catch empty payloads before liveness stays green."
+      content="Integrity checks for Solana indexers: shape, reconcile, completeness. Verify indexed account data is correct, not just flowing."
     />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@600;700;800&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=IBM+Plex+Mono:wght@400;600&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="styles.css" />
   </head>
-  <body>
-    <div class="atmosphere" aria-hidden="true"></div>
+  <body id="top">
+    <nav class="topbar" aria-label="Primary">
+      <div class="topbar-inner">
+        <a class="wordmark" href="#top">karat67</a>
+        <div class="topbar-nav">
+          <a href="#cases">Cases</a>
+          <a href="#deploy">Deploy</a>
+          <a href="https://github.com/SGDlab67/karat67">Source</a>
+        </div>
+      </div>
+    </nav>
 
     <header class="hero">
-      <p class="brand">karat67</p>
-      <h1 class="headline">Prove indexer data matches the chain.</h1>
-      <p class="lede">
-        Green liveness hid empty Kamino payloads for 158.91 hours. Shape,
-        reconcile, and completeness fail the job when bytes are wrong.
-      </p>
-      <div class="cta-group">
-        <a class="cta cta-primary" href="#try">Run the demo</a>
-        <a class="cta cta-secondary" href="#deploy">Deploy the check</a>
+      <div class="shell">
+        <h1 class="hero-title">Prove the indexed bytes are right.</h1>
+        <p class="hero-lede">
+          An indexer passes every freshness and throughput check while writing
+          empty or malformed accounts. In the incident this project came out of,
+          green liveness hid empty Kamino payloads for
+          <strong>158.91 hours</strong>. karat67 shapes the exact bytes your
+          index stored, reconciles them against chain, and exits non-zero when
+          they disagree.
+        </p>
       </div>
     </header>
 
-    <main>
-      <section class="flow-section" aria-labelledby="flow-heading">
-        <h2 id="flow-heading">Integrity flow</h2>
-        <p class="section-note">
-          Wire after decode. Exit&nbsp;0 only when every step is Pass.
+    <section class="instrument" id="cases" aria-labelledby="cases-title">
+      <div class="shell">
+        <form class="instrument-grid" id="gate-form" novalidate>
+          <div class="panel">
+            <div class="panel-head">
+              <h2 class="panel-title" id="cases-title">Pick a case</h2>
+              <p class="panel-note">Four constructed, one live</p>
+            </div>
+
+            <ul class="cases" role="list">
+              <li class="case">
+                <input
+                  class="case-input"
+                  type="radio"
+                  name="case"
+                  id="case-healthy"
+                  value="healthy"
+                  checked
+                />
+                <label class="case-label" for="case-healthy">
+                  <span class="case-dot" aria-hidden="true"></span>
+                  <span class="case-name">Healthy Obligation</span>
+                  <span class="case-desc">
+                    3344 bytes with the Obligation discriminator, the length the
+                    IDL declares.
+                    <span class="case-origin" data-origin="constructed"
+                      >constructed in this page</span
+                    >
+                  </span>
+                </label>
+              </li>
+
+              <li class="case">
+                <input
+                  class="case-input"
+                  type="radio"
+                  name="case"
+                  id="case-empty"
+                  value="empty"
+                />
+                <label class="case-label" for="case-empty">
+                  <span class="case-dot" aria-hidden="true"></span>
+                  <span class="case-name">Empty payload</span>
+                  <span class="case-desc">
+                    0 bytes where an Obligation belongs. This is the production
+                    class that stayed hidden for 158.91 hours.
+                    <span class="case-origin" data-origin="constructed"
+                      >constructed in this page</span
+                    >
+                  </span>
+                </label>
+              </li>
+
+              <li class="case">
+                <input
+                  class="case-input"
+                  type="radio"
+                  name="case"
+                  id="case-truncated"
+                  value="truncated"
+                />
+                <label class="case-label" for="case-truncated">
+                  <span class="case-dot" aria-hidden="true"></span>
+                  <span class="case-name">Truncated write</span>
+                  <span class="case-desc">
+                    The Obligation discriminator followed by 16 bytes, 24 of
+                    3344 in all.
+                    <span class="case-origin" data-origin="constructed"
+                      >constructed in this page</span
+                    >
+                  </span>
+                </label>
+              </li>
+
+              <li class="case">
+                <input
+                  class="case-input"
+                  type="radio"
+                  name="case"
+                  id="case-collision"
+                  value="collision"
+                />
+                <label class="case-label" for="case-collision">
+                  <span class="case-dot" aria-hidden="true"></span>
+                  <span class="case-name">Right length, wrong type</span>
+                  <span class="case-desc">
+                    424 bytes, the exact length of a Meteora
+                    <code>VirtualPool</code>, carrying a different
+                    discriminator seen on the same program. A length-only check
+                    passes this; the gate names it unregistered.
+                    <span class="case-origin" data-origin="constructed"
+                      >constructed in this page</span
+                    >
+                  </span>
+                </label>
+              </li>
+
+              <li class="case">
+                <input
+                  class="case-input"
+                  type="radio"
+                  name="case"
+                  id="case-live"
+                  value="live"
+                />
+                <label class="case-label" for="case-live">
+                  <span class="case-dot" aria-hidden="true"></span>
+                  <span class="case-name">Live account from chain</span>
+                  <span class="case-desc">
+                    You supply a pubkey and your own RPC endpoint. Runs the full
+                    gate, shape then reconcile.
+                    <span class="case-origin" data-origin="live"
+                      >fetched from chain</span
+                    >
+                  </span>
+                </label>
+              </li>
+            </ul>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2 class="panel-title">Byte field</h2>
+              <p class="panel-note">What the IDL declares, what was written</p>
+            </div>
+
+            <div class="bytefield" id="bytefield">
+              <div class="byterow">
+                <span class="byterow-label" id="idl-label">IDL, Obligation</span>
+                <div class="bar">
+                  <div class="bar-fill" id="bar-idl" style="width: 100%"></div>
+                  <span class="bar-disc" id="idl-disc" aria-hidden="true"></span>
+                </div>
+                <span class="byterow-count" id="idl-count">3344 bytes</span>
+              </div>
+              <div class="byterow">
+                <span class="byterow-label">Indexer wrote</span>
+                <div class="bar">
+                  <div class="bar-fill" id="bar-wrote" style="width: 0%"></div>
+                </div>
+                <span class="byterow-count" id="wrote-count">3344 bytes</span>
+              </div>
+              <p class="bytefield-void" id="bytefield-void"></p>
+            </div>
+
+            <pre
+              class="readout"
+              id="gate-out"
+              role="region"
+              aria-live="polite"
+              aria-label="Gate readout"
+            ><code class="line-muted">Loading the WebAssembly module.</code></pre>
+
+            <div class="run-row">
+              <button type="submit" class="btn" id="run-gate">Run gate</button>
+              <p class="run-hint">
+                The verdict comes from the karat67 crate compiled to
+                WebAssembly, running in this tab.
+              </p>
+            </div>
+
+            <details class="advanced" id="advanced">
+              <summary>Your own payload and endpoint</summary>
+              <div class="advanced-body">
+                <div class="field">
+                  <label class="field-label" for="indexed">
+                    Indexed payload, base64
+                  </label>
+                  <textarea
+                    id="indexed"
+                    name="indexed"
+                    rows="4"
+                    spellcheck="false"
+                    autocomplete="off"
+                    placeholder="Base64 of the account bytes exactly as your index stored them"
+                  ></textarea>
+                  <p class="field-hint">
+                    Passed through unmodified. No discriminator is rebuilt and
+                    nothing is padded to an IDL length, so a truncated or empty
+                    row stays truncated or empty. Fill this in and it replaces
+                    the selected constructed case.
+                  </p>
+                </div>
+
+                <div class="field">
+                  <label class="field-label" for="account">Account pubkey</label>
+                  <input
+                    type="text"
+                    id="account"
+                    name="account"
+                    spellcheck="false"
+                    autocomplete="off"
+                    placeholder="Base-58 pubkey of the account your indexer wrote"
+                  />
+                  <p class="field-hint">
+                    Labels the result and keys the chain fetch. The live case
+                    needs it; shape alone does not.
+                  </p>
+                </div>
+
+                <div class="field">
+                  <label class="field-label" for="rpc">
+                    Solana JSON-RPC endpoint
+                  </label>
+                  <input
+                    type="url"
+                    id="rpc"
+                    name="rpc"
+                    spellcheck="false"
+                    autocomplete="off"
+                    placeholder="https://your-endpoint.example/..."
+                  />
+                  <p class="field-hint">
+                    This site hosts no RPC and has no backend, so the endpoint
+                    is sent only to the host you type here and is kept in this
+                    browser's <code>localStorage</code>. Your provider must
+                    allow browser requests (CORS) from this origin.
+                  </p>
+                </div>
+
+                <div class="field">
+                  <label class="field-label" for="indexed-slot">
+                    Indexed write slot, optional
+                  </label>
+                  <input
+                    type="number"
+                    id="indexed-slot"
+                    name="indexed-slot"
+                    min="0"
+                    step="1"
+                    inputmode="numeric"
+                    placeholder="e.g. 298134512"
+                  />
+                  <p class="field-hint">
+                    Enables slot-lag tolerance on a byte mismatch. Without it,
+                    any mismatch is a hard fail rather than skipped.
+                  </p>
+                </div>
+
+                <div class="run-row">
+                  <p class="run-hint">
+                    Endpoint in this browser: <code id="endpoint-state">none set</code>
+                  </p>
+                  <button type="button" class="btn btn-quiet" id="clear-endpoint">
+                    Forget endpoint
+                  </button>
+                </div>
+              </div>
+            </details>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section class="section" id="decides" aria-labelledby="decides-title">
+      <div class="shell">
+        <h2 class="section-title" id="decides-title">How the gate decides</h2>
+        <p class="section-lede">
+          One decision point, <code>karat67::gate::check_account</code>, is what
+          the CLI, the Carbon processor hook, the MCP tool, and this page all
+          call. None of them can reach a verdict the others would not.
         </p>
-        <ol class="flow" id="integrity-flow">
-          <li class="flow-step" data-step="shape">
-            <span class="flow-num">01</span>
-            <span class="flow-label">Shape</span>
-            <span class="flow-desc">IDL length &amp; discriminator</span>
+        <ol class="ladder">
+          <li class="rung">
+            <span class="rung-num">01</span>
+            <h3 class="rung-name">Shape</h3>
+            <p class="rung-desc">
+              The exact indexed bytes against the account registry: an 8-byte
+              Anchor discriminator that resolves to a known type, then that
+              type's declared length, exactly. Obligation 3344, UserMetadata
+              1032, Reserve 8624, LendingMarket 4664.
+            </p>
+            <p class="rung-branch">
+              A non-Pass shape returns alone. The fetcher is never invoked, so
+              no RPC call goes out and nothing downstream can paper over bytes
+              that are already wrong.
+            </p>
           </li>
-          <li class="flow-arrow" aria-hidden="true"></li>
-          <li class="flow-step" data-step="reconcile">
-            <span class="flow-num">02</span>
-            <span class="flow-label">Reconcile</span>
-            <span class="flow-desc">Bytes vs chain · slot-lag</span>
+          <li class="rung">
+            <span class="rung-num">02</span>
+            <h3 class="rung-name">Reconcile</h3>
+            <p class="rung-desc">
+              Shape passing earns the fetch. The same key comes back through
+              <code>getMultipleAccounts</code> and the bytes are diffed. Equal
+              bytes pass. A mismatch within the slot-lag window is skipped with
+              its reason, never passed. Beyond the window, or with no write
+              slot, it fails.
+            </p>
           </li>
-          <li class="flow-arrow" aria-hidden="true"></li>
-          <li class="flow-step" data-step="completeness">
-            <span class="flow-num">03</span>
-            <span class="flow-label">Completeness</span>
-            <span class="flow-desc">Indexed slots vs getBlocks</span>
+          <li class="rung">
+            <span class="rung-num">03</span>
+            <h3 class="rung-name">Completeness</h3>
+            <p class="rung-desc">
+              Indexed slots against <code>getBlocks</code> over the same range,
+              which catches the gap a per-account check cannot see: rows that
+              are individually correct and collectively missing.
+            </p>
           </li>
-          <li class="flow-arrow" aria-hidden="true"></li>
-          <li class="flow-step flow-exit" data-step="exit">
-            <span class="flow-num">04</span>
-            <span class="flow-label">Exit codes</span>
-            <span class="flow-desc"><code>0</code> iff all Pass</span>
+          <li class="rung">
+            <span class="rung-num">04</span>
+            <h3 class="rung-name">Exit code</h3>
+            <p class="rung-desc">
+              Exit 0 only when the result set is non-empty and every status is
+              Pass. Skipped is not Pass, so a check that could not run still
+              exits 1, and the readout says which of the two happened.
+            </p>
           </li>
         </ol>
-      </section>
+      </div>
+    </section>
 
-      <section id="try" class="try-section" aria-labelledby="try-heading">
-        <h2 id="try-heading">Try it — offline shape gate</h2>
-        <p class="section-note">
-          Client-side simulation of <code>karat shape</code> JSON and exit
-          codes for Kamino <code>UserMetadata</code> (1032 pass · 0 fail).
-          Same outcomes as the CLI; not a hosted RPC service.
+    <section class="section" id="deploy" aria-labelledby="deploy-title">
+      <div class="shell">
+        <h2 class="section-title" id="deploy-title">Deploy the check</h2>
+        <p class="section-lede">
+          Shape needs no RPC and no secrets, so it runs in CI as it does in this
+          tab. Reconcile and completeness stay opt-in behind
+          <code>KARAT_RPC_URL</code>.
         </p>
 
-        <div class="try-controls">
-          <button type="button" class="try-btn" id="btn-pass" data-case="pass">
-            Pass · len 1032
-          </button>
-          <button type="button" class="try-btn" id="btn-fail" data-case="fail">
-            Fail · len 0
-          </button>
-          <button type="button" class="try-btn try-btn-run" id="btn-both" data-case="both">
-            Run both
-          </button>
-        </div>
-
-        <div class="terminal" role="region" aria-live="polite" aria-label="Shape gate output">
-          <div class="terminal-bar">
-            <span class="terminal-dot"></span>
-            <span class="terminal-dot"></span>
-            <span class="terminal-dot"></span>
-            <span class="terminal-title">karat shape · offline simulation</span>
-          </div>
-          <pre id="demo-out" class="terminal-body"><code>// Click Pass, Fail, or Run both
-// Matches CLI: karat --json shape --account-type UserMetadata --len &lt;N&gt;</code></pre>
-        </div>
-
-        <div class="cli-one-liner">
-          <p class="cli-label">Real binary (camera path)</p>
-          <div class="copy-block copy-inline">
-            <button type="button" class="copy-btn" data-copy="cli-cmd">Copy</button>
-            <pre id="cli-cmd"><code>bash demo/worlds_fair.sh</code></pre>
-          </div>
-          <p class="hint">
-            Builds and runs both cases against the real
-            <code>karat</code> binary — pass at 1032, fail at empty payload.
-          </p>
-        </div>
-      </section>
-
-      <section id="pitch" class="pitch-section" aria-labelledby="pitch-heading">
-        <h2 id="pitch-heading">60-second pitch</h2>
-        <ol class="pitch-beats">
-          <li>
-            <span class="beat-time">0:00</span>
-            <p>
-              Indexers can look perfectly healthy while writing garbage.
-              karat67 is chain-truth CI — not another dashboard.
-            </p>
-          </li>
-          <li>
-            <span class="beat-time">0:15</span>
-            <p>
-              <strong>Pass.</strong> Shape on UserMetadata at 1032 bytes —
-              the check passes. Your pipeline can gate on that.
-            </p>
-          </li>
-          <li>
-            <span class="beat-time">0:30</span>
-            <p>
-              <strong>Fail.</strong> Same type, zero-byte payload — the silent
-              corruption class from production. Shape fails. Exit 1.
-            </p>
-          </li>
-          <li>
-            <span class="beat-time">0:45</span>
-            <p>
-              Liveness and freshness can stay green the whole time. That is
-              why shape exists — and why empty payloads must fail the job.
-            </p>
-          </li>
-        </ol>
-      </section>
-
-      <section id="deploy" class="deploy-section" aria-labelledby="deploy-heading">
-        <h2 id="deploy-heading">Deploy the check</h2>
-        <p>
-          Offline shape gate in CI — no RPC, no secrets. Copy into your
-          workflow, or start from
-          <code>.github/workflows/shape-check.example.yml</code>.
-        </p>
-        <div class="copy-block">
+        <div class="codeblock">
           <button type="button" class="copy-btn" data-copy="shape-workflow">
             Copy workflow
           </button>
@@ -167,22 +379,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Offline shape check (no RPC)
-        run: cargo run --release --bin karat -- shape --account-type UserMetadata --len 1032</code></pre>
+      - name: Shape check, no RPC
+        run: cargo run --release --bin karat -- shape --account-type Obligation --len 3344</code></pre>
         </div>
-        <p class="hint">
-          Live reconcile/completeness stay opt-in via
-          <code>KARAT_RPC_URL</code>. This site does not host an RPC service.
+        <p class="field-hint">
+          Or start from
+          <code>.github/workflows/shape-check.example.yml</code> in the repo.
         </p>
-        <p class="repo-link">
-          <a href="https://github.com/SGDlab67/karat67">github.com/SGDlab67/karat67</a>
-        </p>
-      </section>
-    </main>
+
+        <h3 class="sub-title">Or call the crate</h3>
+        <div class="codeblock">
+          <button type="button" class="copy-btn" data-copy="cargo-add">Copy</button>
+          <pre id="cargo-add"><code>cargo add karat67</code></pre>
+        </div>
+      </div>
+    </section>
 
     <footer>
-      <p>MIT · Colosseum Crypto World&apos;s Fair 2026</p>
+      <div class="shell">
+        <p>MIT licensed. No RPC hosted here, no backend.</p>
+        <p>
+          <a href="https://github.com/SGDlab67/karat67">github.com/SGDlab67/karat67</a>
+        </p>
+      </div>
     </footer>
-    <script src="main.js"></script>
+
+    <script type="module" src="main.js"></script>
   </body>
 </html>
