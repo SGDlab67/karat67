@@ -96,3 +96,9 @@ bytes were wrong, and nothing was looking at the bytes.
 That is what `shape` looks at: the account's length and Anchor discriminator
 against the IDL. Run it over this slice and every `data_len = 0` row fails,
 with no RPC and no network.
+
+## Related: DBC sweep residual (647)
+
+The Meteora DBC mainnet sweep numbers in `src/checks/specs.rs` leave **647**
+accounts outside the attributed rows. Classification (and why that refuses an
+"accounts for all" claim) is in [`unexplained-647.md`](unexplained-647.md).
