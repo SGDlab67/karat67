@@ -145,11 +145,13 @@ impl SlotCoverageFetcher for MockFetcher {
 /// Uses a blocking, rustls-based HTTP client (`ureq`) so the build stays
 /// toolchain-only: no OpenSSL/`libssl-dev` system dependency in CI or the
 /// Cloud Agent environment. The endpoint is configurable, never hardcoded.
+#[cfg(feature = "rpc")]
 pub struct RpcAccountFetcher {
     endpoint: String,
     agent: ureq::Agent,
 }
 
+#[cfg(feature = "rpc")]
 impl RpcAccountFetcher {
     /// Build a fetcher targeting `endpoint` (a Solana JSON-RPC URL).
     pub fn new(endpoint: impl Into<String>) -> Self {
@@ -160,6 +162,7 @@ impl RpcAccountFetcher {
     }
 }
 
+#[cfg(feature = "rpc")]
 impl AccountFetcher for RpcAccountFetcher {
     fn get_multiple_accounts(&self, keys: &[String]) -> anyhow::Result<FetchResult> {
         let request = serde_json::json!({
@@ -208,6 +211,7 @@ impl AccountFetcher for RpcAccountFetcher {
     }
 }
 
+#[cfg(feature = "rpc")]
 impl SlotCoverageFetcher for RpcAccountFetcher {
     fn get_blocks(&self, start: u64, end: u64) -> anyhow::Result<Vec<u64>> {
         if end < start {
@@ -255,6 +259,7 @@ impl SlotCoverageFetcher for RpcAccountFetcher {
 ///
 /// `null` means the account does not exist (`None`); otherwise the `data`
 /// field is `[base64_string, "base64"]` per the requested encoding.
+#[cfg(feature = "rpc")]
 fn decode_account(
     value: &serde_json::Value,
     context_slot: u64,

@@ -2,10 +2,10 @@ use std::io::IsTerminal;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use karat67::checks::completeness::check_completeness;
+use karat67::checks::completeness::{check_completeness, check_orphans};
 use karat67::checks::reconcile::{DEFAULT_MAX_SLOT_LAG, SampleRow, reconcile};
 use karat67::checks::shape::{AccountSpec, check_shape};
-use karat67::checks::specs::{account_type_names, find_by_account_type};
+use karat67::checks::specs::{LenRule, account_type_names, find_by_account_type};
 use karat67::fetch::{AccountFetcher, RpcAccountFetcher};
 use karat67::gate::{all_pass, check_account};
 use karat67::report::{CheckResult, Status};
@@ -66,6 +66,30 @@ enum Command {
     /// Leader skip-slots omitted by `getBlocks` are not gaps. Exits non-zero
     /// unless the result is Pass — Fail and Skipped both fail the process.
     Completeness {
+        /// Solana JSON-RPC endpoint. Falls back to `KARAT_RPC_URL`.
+        #[arg(long, env = "KARAT_RPC_URL")]
+        rpc_url: String,
+        /// Inclusive start of the slot window to check.
+        #[arg(long)]
+        start: u64,
+        /// Inclusive end of the slot window to check.
+        #[arg(long)]
+        end: u64,
+        /// Indexed slot. Repeatable; combined with `--slots` if both are given.
+        #[arg(long = "slot")]
+        slot: Vec<u64>,
+        /// Comma-separated indexed slots, e.g. `100,101,103`. Combined with
+        /// repeatable `--slot` values.
+        #[arg(long = "slots")]
+        slots: Option<String>,
+    },
+    /// Orphans: the mirror of completeness. Find indexed slots inside the
+    /// window that `getBlocks` never produced, meaning the index holds state
+    /// for a slot that was skipped or forked away. Unlike completeness, a slot
+    /// absent from `getBlocks` is a finding here when the index wrote it.
+    /// Exits non-zero unless the result is Pass: Fail and Skipped both fail
+    /// the process.
+    Orphans {
         /// Solana JSON-RPC endpoint. Falls back to `KARAT_RPC_URL`.
         #[arg(long, env = "KARAT_RPC_URL")]
         rpc_url: String,
@@ -192,22 +216,7 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("--end {end} is before --start {start}");
             }
 
-            let mut indexed = slot;
-            if let Some(csv) = slots {
-                for part in csv.split(',') {
-                    let part = part.trim();
-                    if part.is_empty() {
-                        continue;
-                    }
-                    let value: u64 = part
-                        .parse()
-                        .map_err(|e| anyhow::anyhow!("invalid slot in --slots {part:?}: {e}"))?;
-                    indexed.push(value);
-                }
-            }
-            if indexed.is_empty() {
-                anyhow::bail!("provide at least one indexed slot via --slot or --slots");
-            }
+            let indexed = collect_indexed_slots(slot, slots)?;
 
             let fetcher = RpcAccountFetcher::new(rpc_url);
             let result = check_completeness(&indexed, start, end, &fetcher);
@@ -219,6 +228,32 @@ fn main() -> anyhow::Result<()> {
             }
             // Exit 0 only on Pass. Skipped (unreachable fetch) and Fail both
             // fail the process — same policy as reconcile.
+            if result.status != Status::Pass {
+                std::process::exit(1);
+            }
+        }
+        Command::Orphans {
+            rpc_url,
+            start,
+            end,
+            slot,
+            slots,
+        } => {
+            if end < start {
+                anyhow::bail!("--end {end} is before --start {start}");
+            }
+
+            let indexed = collect_indexed_slots(slot, slots)?;
+
+            let fetcher = RpcAccountFetcher::new(rpc_url);
+            let result = check_orphans(&indexed, start, end, &fetcher);
+
+            if cli.json || !std::io::stdout().is_terminal() {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print_orphans_human(start, end, indexed.len(), &result);
+            }
+            // Same policy as completeness: exit 0 only on Pass.
             if result.status != Status::Pass {
                 std::process::exit(1);
             }
@@ -252,6 +287,31 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Merge repeatable `--slot` values with a comma-separated `--slots` string.
+///
+/// Shared by the slot-window checks so both read their input identically. An
+/// empty result is an error, not a vacuous Pass: a window with no indexed
+/// slots supplied proves nothing in either direction.
+fn collect_indexed_slots(slot: Vec<u64>, slots: Option<String>) -> anyhow::Result<Vec<u64>> {
+    let mut indexed = slot;
+    if let Some(csv) = slots {
+        for part in csv.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let value: u64 = part
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid slot in --slots {part:?}: {e}"))?;
+            indexed.push(value);
+        }
+    }
+    if indexed.is_empty() {
+        anyhow::bail!("provide at least one indexed slot via --slot or --slots");
+    }
+    Ok(indexed)
+}
+
 /// Terminal report: what was expected, what was seen, and what it means.
 fn print_human(spec: &AccountSpec, len: usize, result: &CheckResult) {
     let color = std::env::var_os("NO_COLOR").is_none();
@@ -270,15 +330,25 @@ fn print_human(spec: &AccountSpec, len: usize, result: &CheckResult) {
 
     println!();
     println!(
-        "  {}  shape check · Kamino Lend {}",
+        "  {}  shape check · {} {}",
         paint("1;33", "karat67"),
+        spec.program,
         spec.account_type
     );
     println!();
-    println!(
-        "  expected   {:>6} bytes   (IDL layout, discriminator {disc})",
-        group(spec.data_len)
-    );
+    // A variable-length type's registered size is a floor, not a layout, and
+    // printing it as "expected N bytes (IDL layout)" would report a minimum as
+    // an exact requirement.
+    match spec.len_rule {
+        LenRule::Exact => println!(
+            "  expected   {:>6} bytes   (IDL layout, discriminator {disc})",
+            group(spec.data_len)
+        ),
+        LenRule::AtLeast => println!(
+            "  minimum    {:>6} bytes   (variable layout, discriminator {disc})",
+            group(spec.data_len)
+        ),
+    }
     println!("  observed   {:>6} bytes", group(len));
     println!();
     match result.status {
@@ -332,6 +402,53 @@ fn print_completeness_human(start: u64, end: u64, indexed_len: usize, result: &C
             let detail = result.detail.as_deref().unwrap_or("missing slots");
             println!("  {}  {detail}", paint("1;31", "FAIL"));
             println!("        produced slots from getBlocks are absent from the index");
+            println!();
+            println!("  exit code 1: a pipeline or CI job stops here");
+        }
+        Status::Skipped => {
+            let detail = result.detail.as_deref().unwrap_or("check skipped");
+            println!("  {}  {detail}", paint("1;33", "SKIP"));
+            println!();
+            println!("  exit code 1: Skipped is never green");
+        }
+    }
+    println!();
+}
+
+/// Terminal report for orphans: window, outcome, and why the skip-slot rule
+/// is read the other way around here.
+fn print_orphans_human(start: u64, end: u64, indexed_len: usize, result: &CheckResult) {
+    let color = std::env::var_os("NO_COLOR").is_none();
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
+
+    println!();
+    println!(
+        "  {}  orphan check · slots [{start}..={end}]",
+        paint("1;33", "karat67")
+    );
+    println!();
+    println!("  indexed    {:>6} slot(s) supplied", group(indexed_len));
+    println!();
+    match result.status {
+        Status::Pass => {
+            println!(
+                "  {}  every indexed slot in the window was produced on chain",
+                paint("1;32", "PASS")
+            );
+            println!("        indexed slots outside the window are not considered");
+        }
+        Status::Fail => {
+            let detail = result.detail.as_deref().unwrap_or("orphaned slots");
+            println!("  {}  {detail}", paint("1;31", "FAIL"));
+            println!("        the index holds state for slots getBlocks never returned:");
+            println!("        skipped or forked away, so that state never landed on chain");
+            println!("        writing at `processed` for latency is how this happens");
             println!();
             println!("  exit code 1: a pipeline or CI job stops here");
         }

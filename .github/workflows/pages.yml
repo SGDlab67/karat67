@@ -22,6 +22,21 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+
+      # site/pkg is a build artefact, not committed: wasm-pack writes a
+      # .gitignore into it. Build it here so the upload below has it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - name: Build the in-browser gate
+        run: wasm-pack build --target web --out-dir site/pkg -- --no-default-features --features wasm
+      - name: Fail if the gate did not build
+        run: test -s site/pkg/karat67_bg.wasm
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

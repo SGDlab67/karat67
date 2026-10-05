@@ -15,5 +15,9 @@ pub mod carbon;
 pub mod checks;
 pub mod fetch;
 pub mod gate;
+#[cfg(feature = "rpc")]
 pub mod mcp;
 pub mod report;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;

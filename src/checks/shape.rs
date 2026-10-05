@@ -12,20 +12,24 @@
 //! adding a type is a new [`AccountSpec`] row, not a new match arm here.
 
 use crate::checks::check::Check;
-use crate::checks::specs::find_by_discriminator;
+use crate::checks::specs::{LenRule, find_by_discriminator};
 use crate::report::CheckResult;
 
 // Re-export registry types callers historically imported from this module.
-pub use crate::checks::specs::{AccountSpec, KAMINO_ACCOUNTS};
+pub use crate::checks::specs::{AccountSpec, KAMINO_ACCOUNTS, METEORA_DBC_ACCOUNTS};
 
 /// Check an observed account payload against the account registry.
 ///
 /// Fails on: empty or too-short data (under 8 bytes), an unknown
-/// discriminator, or a length that does not exactly match the matched
-/// account type's IDL-declared size (truncated or over-long).
+/// discriminator, or a length the matched account type's rule rejects. For a
+/// fixed-layout type that means any length other than the IDL-declared size
+/// (truncated or over-long); for a type carrying variable-length fields it
+/// means a length below the declared floor, since nothing above the floor is
+/// evidence of corruption.
 ///
-/// All type-specific knowledge comes from [`KAMINO_ACCOUNTS`]; there is no
-/// per-account match arm in this function.
+/// All type-specific knowledge comes from the registry tables; there is no
+/// per-account match arm in this function. The only branch is on the kind of
+/// length rule, which is itself registry data.
 pub fn check_shape(data: &[u8]) -> CheckResult {
     if data.len() < 8 {
         let what = if data.is_empty() {
@@ -48,25 +52,47 @@ pub fn check_shape(data: &[u8]) -> CheckResult {
     };
 
     let name = format!("shape({})", spec.account_type);
-    if data.len() == spec.data_len {
-        CheckResult::pass(name)
-    } else {
-        let (what, diff) = if data.len() < spec.data_len {
-            (
-                "truncated",
-                format!("{} missing", spec.data_len - data.len()),
+    match spec.len_rule {
+        LenRule::Exact => {
+            if data.len() == spec.data_len {
+                return CheckResult::pass(name);
+            }
+            let (what, diff) = if data.len() < spec.data_len {
+                (
+                    "truncated",
+                    format!("{} missing", spec.data_len - data.len()),
+                )
+            } else {
+                ("over-long", format!("{} extra", data.len() - spec.data_len))
+            };
+            CheckResult::fail(
+                name,
+                format!(
+                    "{what}: expected {} bytes, got {} ({diff})",
+                    spec.data_len,
+                    data.len()
+                ),
             )
-        } else {
-            ("over-long", format!("{} extra", data.len() - spec.data_len))
-        };
-        CheckResult::fail(
-            name,
-            format!(
-                "{what}: expected {} bytes, got {} ({diff})",
-                spec.data_len,
-                data.len()
-            ),
-        )
+        }
+        // A variable-length type has no upper bound to check, so the only
+        // failure is an underrun. It is worded differently on purpose: the
+        // number quoted is a floor, and a reader who sees "expected 148 bytes"
+        // would go looking for a fixed layout that does not exist.
+        LenRule::AtLeast => {
+            if data.len() >= spec.data_len {
+                CheckResult::pass(name)
+            } else {
+                CheckResult::fail(
+                    name,
+                    format!(
+                        "under minimum: expected at least {} bytes, got {} ({} missing)",
+                        spec.data_len,
+                        data.len(),
+                        spec.data_len - data.len()
+                    ),
+                )
+            }
+        }
     }
 }
 
@@ -113,6 +139,14 @@ mod tests {
 
     const OBLIGATION_DISCRIMINATOR: [u8; 8] = [168, 206, 141, 106, 88, 76, 172, 167];
     const OBLIGATION_LEN: usize = 3344;
+
+    const VIRTUAL_POOL_DISCRIMINATOR: [u8; 8] = [213, 224, 5, 209, 98, 69, 119, 92];
+    const VIRTUAL_POOL_LEN: usize = 424;
+    /// Observed on mainnet at the same 424 bytes as `VirtualPool`, name not
+    /// resolved, deliberately left out of the registry.
+    const UNRESOLVED_424_DISCRIMINATOR: [u8; 8] = [237, 219, 184, 23, 42, 189, 169, 35];
+    const PARTNER_METADATA_DISCRIMINATOR: [u8; 8] = [68, 68, 130, 19, 16, 209, 98, 156];
+    const PARTNER_METADATA_FLOOR: usize = 148;
 
     /// Builds a buffer of `total_len` bytes: the discriminator followed by
     /// zeroed filler.
@@ -221,5 +255,141 @@ mod tests {
                 format!("shape({})", spec.account_type)
             );
         }
+    }
+
+    /// Lock: Kamino rules stay exact. A variable-length kind now exists in
+    /// the registry, and it must not have loosened the fixed-layout types.
+    #[test]
+    fn kamino_specs_still_reject_over_long_payloads() {
+        for spec in KAMINO_ACCOUNTS {
+            let data = buffer_with_discriminator(spec.discriminator, spec.data_len + 1);
+            let result = check_shape(&data);
+            assert_eq!(
+                result.status,
+                Status::Fail,
+                "{} must still fail one byte over",
+                spec.account_type
+            );
+        }
+    }
+
+    /// Every DBC type added as data only is accepted at its observed length
+    /// through the same registry lookup, with no DBC branch in check_shape.
+    #[test]
+    fn dbc_specs_pass_at_their_registered_length() {
+        assert_eq!(METEORA_DBC_ACCOUNTS.len(), 6);
+        for spec in METEORA_DBC_ACCOUNTS {
+            let data = buffer_with_discriminator(spec.discriminator, spec.data_len);
+            let result = check_shape(&data);
+            assert_eq!(
+                result.status,
+                Status::Pass,
+                "{} at {} bytes should pass via registry lookup only",
+                spec.account_type,
+                spec.data_len
+            );
+            assert_eq!(result.check, format!("shape({})", spec.account_type));
+            assert_eq!(
+                ShapeCheck::new(&data).name(),
+                format!("shape({})", spec.account_type)
+            );
+        }
+    }
+
+    #[test]
+    fn dbc_virtual_pool_truncated_by_one_byte_fails() {
+        let data = buffer_with_discriminator(VIRTUAL_POOL_DISCRIMINATOR, VIRTUAL_POOL_LEN - 1);
+        let result = check_shape(&data);
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("truncated: expected 424 bytes, got 423 (1 missing)")
+        );
+    }
+
+    #[test]
+    fn dbc_pool_config_truncated_by_one_byte_fails() {
+        let spec = find_by_account_type("PoolConfig").expect("PoolConfig in registry");
+        let data = buffer_with_discriminator(spec.discriminator, spec.data_len - 1);
+        let result = check_shape(&data);
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("truncated: expected 1048 bytes, got 1047 (1 missing)")
+        );
+    }
+
+    /// The headline finding, as a test: 424 bytes is shared by `VirtualPool`
+    /// and by an unresolved type, so a length-only check would have called
+    /// both of them `VirtualPool`. The discriminator is what decides.
+    #[test]
+    fn same_424_length_does_not_make_an_unresolved_type_a_virtual_pool() {
+        let virtual_pool = buffer_with_discriminator(VIRTUAL_POOL_DISCRIMINATOR, VIRTUAL_POOL_LEN);
+        let result = check_shape(&virtual_pool);
+        assert_eq!(result.status, Status::Pass);
+        assert_eq!(result.check, "shape(VirtualPool)");
+
+        let impostor = buffer_with_discriminator(UNRESOLVED_424_DISCRIMINATOR, VIRTUAL_POOL_LEN);
+        assert_eq!(impostor.len(), virtual_pool.len());
+        let result = check_shape(&impostor);
+        assert_eq!(result.status, Status::Fail);
+        assert_ne!(result.check, "shape(VirtualPool)");
+        assert_eq!(result.check, "shape");
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("unknown discriminator: [237, 219, 184, 23, 42, 189, 169, 35]")
+        );
+    }
+
+    /// `PartnerMetadata` carries variable-length strings: all three observed
+    /// mainnet lengths are healthy and an exact rule would have failed two.
+    #[test]
+    fn partner_metadata_passes_at_every_observed_length() {
+        for len in [148, 152, 249] {
+            let data = buffer_with_discriminator(PARTNER_METADATA_DISCRIMINATOR, len);
+            let result = check_shape(&data);
+            assert_eq!(
+                result.status,
+                Status::Pass,
+                "PartnerMetadata at {len} bytes was observed on mainnet and must pass"
+            );
+            assert_eq!(result.check, "shape(PartnerMetadata)");
+        }
+    }
+
+    #[test]
+    fn partner_metadata_below_floor_fails_with_minimum_wording() {
+        let data =
+            buffer_with_discriminator(PARTNER_METADATA_DISCRIMINATOR, PARTNER_METADATA_FLOOR - 1);
+        let result = check_shape(&data);
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("under minimum: expected at least 148 bytes, got 147 (1 missing)")
+        );
+    }
+
+    /// The variable-length failure must not be mistakable for a fixed-length
+    /// one: a reader chasing "expected 148 bytes" would look for a layout
+    /// that does not exist.
+    #[test]
+    fn variable_underrun_detail_reads_differently_from_fixed_mismatch() {
+        let variable =
+            buffer_with_discriminator(PARTNER_METADATA_DISCRIMINATOR, PARTNER_METADATA_FLOOR - 1);
+        let variable_detail = check_shape(&variable).detail.expect("fail detail");
+        let fixed = buffer_with_discriminator(VIRTUAL_POOL_DISCRIMINATOR, VIRTUAL_POOL_LEN - 1);
+        let fixed_detail = check_shape(&fixed).detail.expect("fail detail");
+
+        assert!(variable_detail.starts_with("under minimum: expected at least "));
+        assert!(fixed_detail.starts_with("truncated: expected "));
+        assert!(!variable_detail.contains("truncated"));
+    }
+
+    /// No upper bound exists for a variable-length type, so a long payload is
+    /// not evidence of corruption the way it is for a fixed layout.
+    #[test]
+    fn partner_metadata_has_no_upper_bound() {
+        let data = buffer_with_discriminator(PARTNER_METADATA_DISCRIMINATOR, 4096);
+        assert_eq!(check_shape(&data).status, Status::Pass);
     }
 }
