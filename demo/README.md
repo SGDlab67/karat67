@@ -1,5 +1,13 @@
 # World's Fair 60s demo script
 
+**Camera path (one command):**
+
+```bash
+bash demo/worlds_fair.sh
+```
+
+Prints pass (UserMetadata len 1032) then fail (empty payload), with banners for filming.
+
 **~60 seconds, spoken**
 
 Hi — this is karat67. Indexers can look perfectly healthy while writing garbage.
