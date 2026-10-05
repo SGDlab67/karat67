@@ -84,14 +84,12 @@ const CASES = {
     },
     bytes: () => payload(specOf("Obligation"), 24),
   },
-  // 424 bytes is not unique to VirtualPool: the mainnet sweep of the DBC
-  // program found a second, unresolved discriminator at exactly that length.
-  // So this case is byte-length-identical to a healthy VirtualPool and still
-  // has to fail, which is what makes the discriminator load-bearing rather
-  // than decorative. Mirrors the Rust test
-  // same_424_length_does_not_make_an_unresolved_type_a_virtual_pool.
+  // 424 bytes is not unique to VirtualPool: TransferHookPool is the same
+  // length with a different discriminator. A length-only check would accept
+  // this as VirtualPool; the gate names TransferHookPool. Mirrors the Rust
+  // test same_424_length_does_not_make_transfer_hook_pool_a_virtual_pool.
   collision: {
-    name: "right length, unregistered type",
+    name: "right length, TransferHookPool",
     get spec() {
       return specOf("VirtualPool");
     },

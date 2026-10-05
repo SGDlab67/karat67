@@ -27,27 +27,24 @@
 //!
 //! # Why length alone cannot name a type
 //!
-//! The sweep found `VirtualPool` at 424 bytes and a second, distinct
-//! discriminator (`[237, 219, 184, 23, 42, 189, 169, 35]`, still unresolved)
-//! also at 424 bytes. Two different account types, byte-identical in length.
-//! A length-only check would therefore accept one type's bytes as the other's
-//! and silently validate a payload it has never seen a layout for, which is
-//! exactly the "green while wrong" failure this crate exists to catch. The
-//! discriminator is what names a type; the length is only a corroborating
-//! constraint on the named type. That is why every rule here is a pair.
+//! The sweep found `VirtualPool` at 424 bytes and `TransferHookPool` (named
+//! later via `sha256("account:TransferHookPool")[..8]`) also at 424 bytes.
+//! Two different account types, byte-identical in length. A length-only check
+//! would therefore accept one type's bytes as the other's and silently
+//! validate a payload it has never seen a layout for, which is exactly the
+//! "green while wrong" failure this crate exists to catch. The discriminator
+//! is what names a type; the length is only a corroborating constraint on the
+//! named type. That is why every rule here is a pair.
 //!
-//! # Known-unregistered DBC types
+//! # Coverage is not completeness
 //!
-//! The sweep observed two discriminators whose struct names could not be
-//! resolved, so they are deliberately absent from the table below rather than
-//! named on a hunch. `check_shape` will report them as unknown
-//! discriminators, which is the honest answer:
-//!
-//! - `[237, 219, 184, 23, 42, 189, 169, 35]`, 424 bytes, 2,523 accounts
-//! - `[40, 220, 194, 251, 41, 199, 123, 253]`, 1128 bytes, 1,961 accounts
-//!
-//! The DBC table is therefore known to be incomplete. A future reader adding
-//! either type needs the name confirmed the same way (matching
+//! Registering every named type seen in a snapshot still does not license an
+//! "accounts for all" claim: DBC can mint new account kinds, and some IDL
+//! types (`ClaimFeeOperator`, legacy `Config`, `LockEscrow`) had zero live
+//! accounts on the recount that named `TransferHookPool` /
+//! `ConfigWithTransferHook`. Absent rows stay absent until a live account
+//! exists or an Exact zero-count row is added deliberately. A future reader
+//! adding a type still needs the name confirmed the same way (matching
 //! `sha256("account:<StructName>")[..8]`), not inferred from the size.
 
 /// How an account type's `data_len` constrains an observed payload.
@@ -135,8 +132,8 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         program: "Meteora DBC",
         account_type: "VirtualPool",
         discriminator: [213, 224, 5, 209, 98, 69, 119, 92],
-        // 1,738,650 accounts. 424 bytes is NOT unique to this type: see the
-        // unresolved 424-byte discriminator in the module docs.
+        // 1,738,650 accounts. 424 bytes is NOT unique to this type: see
+        // TransferHookPool below.
         data_len: 424,
         len_rule: LenRule::Exact,
     },
@@ -176,10 +173,12 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         program: "Meteora DBC",
         account_type: "PartnerMetadata",
         discriminator: [68, 68, 130, 19, 16, 209, 98, 156],
-        // Variable length: this type carries variable-length strings, and the
-        // sweep observed the same discriminator at 148 bytes (66 accounts),
-        // 152 bytes (30) and 249 bytes (33). An exact rule would have failed
-        // two of those three healthy populations.
+        // Variable length: this type carries variable-length strings. The
+        // original sweep quoted 148 / 152 / 249 (66 + 30 + 33 accounts) as
+        // examples; a later recount saw 100+ distinct lengths, all ≥ 148, and
+        // zero below the floor. An exact rule would fail most of that healthy
+        // population. Those three lengths are illustrations, not an exhaustive
+        // set.
         //
         // 148 is the floor because it is the smallest length ever observed,
         // not because an IDL says the fixed fields total 148. That provenance
@@ -189,6 +188,51 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // observed evidence.
         data_len: 148,
         len_rule: LenRule::AtLeast,
+    },
+    AccountSpec {
+        program: "Meteora DBC",
+        account_type: "VirtualPoolMetadata",
+        discriminator: [217, 37, 82, 250, 43, 47, 228, 254],
+        // Variable length (same string pattern as PartnerMetadata). Disc is
+        // sha256("account:VirtualPoolMetadata")[..8]; present in Meteora DBC
+        // IDL 0.1.2–0.1.6 and carbon meteora-dbc-decoder. Floor 148 is the
+        // fixed-field layout (8 disc + 32 + 96 + 3×4), not the live minimum —
+        // the recount that registered this row saw min 168 / max 393 across
+        // 160 accounts. Same honesty caveat as PartnerMetadata: a legitimate
+        // account below anything observed would still pass at ≥ 148, and
+        // anything below 148 cannot hold the fixed fields.
+        data_len: 148,
+        len_rule: LenRule::AtLeast,
+    },
+    AccountSpec {
+        program: "Meteora DBC",
+        account_type: "Operator",
+        discriminator: [219, 31, 188, 145, 69, 139, 204, 117],
+        // 1 account at sweep recount. Exact 72 = 8 disc + 32 + 16 + 16 from
+        // Meteora layout / carbon decoder. Disc is sha256("account:Operator")[..8].
+        data_len: 72,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Meteora DBC",
+        account_type: "TransferHookPool",
+        discriminator: [237, 219, 184, 23, 42, 189, 169, 35],
+        // ~2,523 accounts in the original sweep (counted then as a known
+        // unknown). Exact 424 = INIT_SPACE 416 + 8. Disc is
+        // sha256("account:TransferHookPool")[..8]. Shares length with
+        // VirtualPool — the collision that makes length-only checks unsafe.
+        data_len: 424,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Meteora DBC",
+        account_type: "ConfigWithTransferHook",
+        discriminator: [40, 220, 194, 251, 41, 199, 123, 253],
+        // ~1,961 accounts in the original sweep (counted then as a known
+        // unknown). Exact 1128 = INIT_SPACE 1120 + 8. Disc is
+        // sha256("account:ConfigWithTransferHook")[..8].
+        data_len: 1128,
+        len_rule: LenRule::Exact,
     },
 ];
 
@@ -282,6 +326,17 @@ mod tests {
                 280,
             ),
             ("TokenBadge", [116, 219, 204, 229, 249, 116, 255, 150], 168),
+            ("Operator", [219, 31, 188, 145, 69, 139, 204, 117], 72),
+            (
+                "TransferHookPool",
+                [237, 219, 184, 23, 42, 189, 169, 35],
+                424,
+            ),
+            (
+                "ConfigWithTransferHook",
+                [40, 220, 194, 251, 41, 199, 123, 253],
+                1128,
+            ),
         ] {
             let spec = find_by_account_type(name).expect("DBC type in registry");
             assert_eq!(spec.discriminator, discriminator);
@@ -296,15 +351,17 @@ mod tests {
 
     #[test]
     fn dbc_424_byte_length_is_shared_by_two_distinct_types() {
-        // The headline finding: VirtualPool is 424 bytes and so is the
-        // unresolved [237, 219, ...] type, so length cannot identify a type.
-        const UNRESOLVED_424: [u8; 8] = [237, 219, 184, 23, 42, 189, 169, 35];
+        // The headline finding: VirtualPool and TransferHookPool are both
+        // 424 bytes, so length cannot identify a type.
         let virtual_pool = find_by_account_type("VirtualPool").expect("VirtualPool in registry");
+        let transfer_hook =
+            find_by_account_type("TransferHookPool").expect("TransferHookPool in registry");
         assert_eq!(virtual_pool.data_len, 424);
-        assert_ne!(virtual_pool.discriminator, UNRESOLVED_424);
-        assert!(
-            find_by_discriminator(UNRESOLVED_424).is_none(),
-            "the unresolved 424-byte type must stay unregistered, not be guessed at"
+        assert_eq!(transfer_hook.data_len, 424);
+        assert_ne!(virtual_pool.discriminator, transfer_hook.discriminator);
+        assert_eq!(
+            transfer_hook.discriminator,
+            [237, 219, 184, 23, 42, 189, 169, 35]
         );
     }
 
@@ -313,7 +370,17 @@ mod tests {
         let spec = find_by_account_type("PartnerMetadata").expect("PartnerMetadata in registry");
         assert_eq!(spec.len_rule, LenRule::AtLeast);
         // 148 is the smallest length observed on mainnet, used as the floor.
+        // 148 / 152 / 249 in the docs are examples; live lengths exceed those.
         assert_eq!(spec.data_len, 148);
+    }
+
+    #[test]
+    fn virtual_pool_metadata_is_a_minimum_length_rule() {
+        let spec =
+            find_by_account_type("VirtualPoolMetadata").expect("VirtualPoolMetadata in registry");
+        assert_eq!(spec.len_rule, LenRule::AtLeast);
+        assert_eq!(spec.data_len, 148);
+        assert_eq!(spec.discriminator, [217, 37, 82, 250, 43, 47, 228, 254]);
     }
 
     #[test]

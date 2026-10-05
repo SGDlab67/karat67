@@ -151,9 +151,10 @@ cargo run --quiet --bin karat-mcp
   types are `AccountSpec` data and the `Check` trait is the uniform seam.
   Adding the second program cost one spec table and zero check code, which was
   the claim; it also surfaced two things worth recording. Length alone cannot
-  name a type (`VirtualPool` and an unresolved DBC type are both 424 bytes), and
+  name a type (`VirtualPool` and `TransferHookPool` are both 424 bytes), and
   not every Anchor account has one legal length, which is why `AccountSpec`
-  carries a `LenRule`. Automated IDL ingest, so a table is generated rather
+  carries a `LenRule`. Coverage of a snapshot is not an "accounts for all"
+  claim. Automated IDL ingest, so a table is generated rather
   than measured, is the next real step.
 - Carbon metrics emission for processor results.
 - Broader agent workflows on top of the shipped `check_account` MCP tool.

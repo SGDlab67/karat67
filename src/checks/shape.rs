@@ -142,11 +142,17 @@ mod tests {
 
     const VIRTUAL_POOL_DISCRIMINATOR: [u8; 8] = [213, 224, 5, 209, 98, 69, 119, 92];
     const VIRTUAL_POOL_LEN: usize = 424;
-    /// Observed on mainnet at the same 424 bytes as `VirtualPool`, name not
-    /// resolved, deliberately left out of the registry.
-    const UNRESOLVED_424_DISCRIMINATOR: [u8; 8] = [237, 219, 184, 23, 42, 189, 169, 35];
+    /// Same on-chain length as `VirtualPool`; formerly the "unresolved 424"
+    /// impostor, now registered as `TransferHookPool`.
+    const TRANSFER_HOOK_POOL_DISCRIMINATOR: [u8; 8] = [237, 219, 184, 23, 42, 189, 169, 35];
     const PARTNER_METADATA_DISCRIMINATOR: [u8; 8] = [68, 68, 130, 19, 16, 209, 98, 156];
     const PARTNER_METADATA_FLOOR: usize = 148;
+    const VIRTUAL_POOL_METADATA_DISCRIMINATOR: [u8; 8] = [217, 37, 82, 250, 43, 47, 228, 254];
+    const VIRTUAL_POOL_METADATA_FLOOR: usize = 148;
+    const OPERATOR_DISCRIMINATOR: [u8; 8] = [219, 31, 188, 145, 69, 139, 204, 117];
+    const OPERATOR_LEN: usize = 72;
+    const CONFIG_WITH_TRANSFER_HOOK_DISCRIMINATOR: [u8; 8] = [40, 220, 194, 251, 41, 199, 123, 253];
+    const CONFIG_WITH_TRANSFER_HOOK_LEN: usize = 1128;
 
     /// Builds a buffer of `total_len` bytes: the discriminator followed by
     /// zeroed filler.
@@ -277,7 +283,7 @@ mod tests {
     /// through the same registry lookup, with no DBC branch in check_shape.
     #[test]
     fn dbc_specs_pass_at_their_registered_length() {
-        assert_eq!(METEORA_DBC_ACCOUNTS.len(), 6);
+        assert_eq!(METEORA_DBC_ACCOUNTS.len(), 10);
         for spec in METEORA_DBC_ACCOUNTS {
             let data = buffer_with_discriminator(spec.discriminator, spec.data_len);
             let result = check_shape(&data);
@@ -320,32 +326,29 @@ mod tests {
     }
 
     /// The headline finding, as a test: 424 bytes is shared by `VirtualPool`
-    /// and by an unresolved type, so a length-only check would have called
-    /// both of them `VirtualPool`. The discriminator is what decides.
+    /// and `TransferHookPool`, so a length-only check would mis-name one as
+    /// the other. The discriminator is what decides.
     #[test]
-    fn same_424_length_does_not_make_an_unresolved_type_a_virtual_pool() {
+    fn same_424_length_does_not_make_transfer_hook_pool_a_virtual_pool() {
         let virtual_pool = buffer_with_discriminator(VIRTUAL_POOL_DISCRIMINATOR, VIRTUAL_POOL_LEN);
         let result = check_shape(&virtual_pool);
         assert_eq!(result.status, Status::Pass);
         assert_eq!(result.check, "shape(VirtualPool)");
 
-        let impostor = buffer_with_discriminator(UNRESOLVED_424_DISCRIMINATOR, VIRTUAL_POOL_LEN);
+        let impostor =
+            buffer_with_discriminator(TRANSFER_HOOK_POOL_DISCRIMINATOR, VIRTUAL_POOL_LEN);
         assert_eq!(impostor.len(), virtual_pool.len());
         let result = check_shape(&impostor);
-        assert_eq!(result.status, Status::Fail);
+        assert_eq!(result.status, Status::Pass);
+        assert_eq!(result.check, "shape(TransferHookPool)");
         assert_ne!(result.check, "shape(VirtualPool)");
-        assert_eq!(result.check, "shape");
-        assert_eq!(
-            result.detail.as_deref(),
-            Some("unknown discriminator: [237, 219, 184, 23, 42, 189, 169, 35]")
-        );
     }
 
-    /// `PartnerMetadata` carries variable-length strings: all three observed
-    /// mainnet lengths are healthy and an exact rule would have failed two.
+    /// `PartnerMetadata` carries variable-length strings: the three originally
+    /// documented lengths (and other lengths above the floor) are healthy.
     #[test]
     fn partner_metadata_passes_at_every_observed_length() {
-        for len in [148, 152, 249] {
+        for len in [148, 152, 249, 221, 252] {
             let data = buffer_with_discriminator(PARTNER_METADATA_DISCRIMINATOR, len);
             let result = check_shape(&data);
             assert_eq!(
@@ -391,5 +394,85 @@ mod tests {
     fn partner_metadata_has_no_upper_bound() {
         let data = buffer_with_discriminator(PARTNER_METADATA_DISCRIMINATOR, 4096);
         assert_eq!(check_shape(&data).status, Status::Pass);
+    }
+
+    #[test]
+    fn virtual_pool_metadata_passes_at_and_above_floor() {
+        for len in [
+            VIRTUAL_POOL_METADATA_FLOOR,
+            168,
+            393,
+            VIRTUAL_POOL_METADATA_FLOOR + 200,
+        ] {
+            let data = buffer_with_discriminator(VIRTUAL_POOL_METADATA_DISCRIMINATOR, len);
+            let result = check_shape(&data);
+            assert_eq!(
+                result.status,
+                Status::Pass,
+                "VirtualPoolMetadata at {len} bytes must pass AtLeast"
+            );
+            assert_eq!(result.check, "shape(VirtualPoolMetadata)");
+        }
+    }
+
+    #[test]
+    fn virtual_pool_metadata_below_floor_fails() {
+        let data = buffer_with_discriminator(
+            VIRTUAL_POOL_METADATA_DISCRIMINATOR,
+            VIRTUAL_POOL_METADATA_FLOOR - 1,
+        );
+        let result = check_shape(&data);
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("under minimum: expected at least 148 bytes, got 147 (1 missing)")
+        );
+    }
+
+    #[test]
+    fn operator_exact_72_passes_and_rejects_neighbors() {
+        let ok = buffer_with_discriminator(OPERATOR_DISCRIMINATOR, OPERATOR_LEN);
+        assert_eq!(check_shape(&ok).status, Status::Pass);
+        assert_eq!(check_shape(&ok).check, "shape(Operator)");
+
+        let short = buffer_with_discriminator(OPERATOR_DISCRIMINATOR, OPERATOR_LEN - 1);
+        assert_eq!(check_shape(&short).status, Status::Fail);
+        let long = buffer_with_discriminator(OPERATOR_DISCRIMINATOR, OPERATOR_LEN + 1);
+        assert_eq!(check_shape(&long).status, Status::Fail);
+    }
+
+    #[test]
+    fn transfer_hook_pool_exact_424_passes_and_rejects_neighbors() {
+        let ok = buffer_with_discriminator(TRANSFER_HOOK_POOL_DISCRIMINATOR, VIRTUAL_POOL_LEN);
+        assert_eq!(check_shape(&ok).status, Status::Pass);
+        assert_eq!(check_shape(&ok).check, "shape(TransferHookPool)");
+
+        let short =
+            buffer_with_discriminator(TRANSFER_HOOK_POOL_DISCRIMINATOR, VIRTUAL_POOL_LEN - 1);
+        assert_eq!(check_shape(&short).status, Status::Fail);
+        let long =
+            buffer_with_discriminator(TRANSFER_HOOK_POOL_DISCRIMINATOR, VIRTUAL_POOL_LEN + 1);
+        assert_eq!(check_shape(&long).status, Status::Fail);
+    }
+
+    #[test]
+    fn config_with_transfer_hook_exact_1128_passes_and_rejects_neighbors() {
+        let ok = buffer_with_discriminator(
+            CONFIG_WITH_TRANSFER_HOOK_DISCRIMINATOR,
+            CONFIG_WITH_TRANSFER_HOOK_LEN,
+        );
+        assert_eq!(check_shape(&ok).status, Status::Pass);
+        assert_eq!(check_shape(&ok).check, "shape(ConfigWithTransferHook)");
+
+        let short = buffer_with_discriminator(
+            CONFIG_WITH_TRANSFER_HOOK_DISCRIMINATOR,
+            CONFIG_WITH_TRANSFER_HOOK_LEN - 1,
+        );
+        assert_eq!(check_shape(&short).status, Status::Fail);
+        let long = buffer_with_discriminator(
+            CONFIG_WITH_TRANSFER_HOOK_DISCRIMINATOR,
+            CONFIG_WITH_TRANSFER_HOOK_LEN + 1,
+        );
+        assert_eq!(check_shape(&long).status, Status::Fail);
     }
 }

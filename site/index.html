@@ -129,9 +129,10 @@
                   <span class="case-name">Right length, wrong type</span>
                   <span class="case-desc">
                     424 bytes, the exact length of a Meteora
-                    <code>VirtualPool</code>, carrying a different
-                    discriminator seen on the same program. A length-only check
-                    passes this; the gate names it unregistered.
+                    <code>VirtualPool</code>, carrying the
+                    <code>TransferHookPool</code> discriminator. A length-only
+                    check would accept this as a VirtualPool; the gate names
+                    TransferHookPool.
                     <span class="case-origin" data-origin="constructed"
                       >constructed in this page</span
                     >
