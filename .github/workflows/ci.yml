@@ -19,3 +19,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all
+      - name: Carbon feature
+        run: |
+          cargo clippy --all-targets --features carbon -- -D warnings
+          cargo test --lib --features carbon carbon

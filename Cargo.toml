@@ -18,6 +18,9 @@ rpc = ["dep:ureq"]
 # wasm-bindgen exports for the in-browser gate. Build with:
 #   wasm-pack build --target web --no-default-features --features wasm
 wasm = ["dep:wasm-bindgen"]
+# `carbon::KaratDecoder`, a wrapper for any Carbon 2 `AccountDecoder`. Pulls
+# the Solana v4 crates Carbon builds on, so it stays off by default.
+carbon = ["dep:carbon-core", "dep:log", "dep:solana-account", "dep:solana-pubkey"]
 
 [dependencies]
 anyhow = "1"
@@ -29,6 +32,10 @@ serde_json = "1"
 # rustls avoids OpenSSL/libssl-dev system deps, keeping CI toolchain-only.
 ureq = { version = "3", features = ["json"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+carbon-core = { version = "2", default-features = false, optional = true }
+log = { version = "0.4", optional = true }
+solana-account = { version = "4", optional = true }
+solana-pubkey = { version = "4", optional = true }
 
 [lib]
 # cdylib for wasm-pack; rlib keeps the crate usable as a normal dependency.

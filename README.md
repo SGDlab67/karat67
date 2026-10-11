@@ -116,15 +116,52 @@ this lesson the same way.
 
 ## Carbon integration
 
-Wire [`KaratIntegrityProcessor`](src/carbon.rs) as a processor **after** account
-decode in a [Carbon](https://github.com/sevenlabs-hq/carbon) pipeline. No Carbon
-crate dependency — drop-in from any decode path.
+With the `carbon` feature, `KaratDecoder` wraps any Carbon 2
+`AccountDecoder`. Wiring it into a pipeline changes one line:
 
-- `check_account(account_type, data)` is the shape check on the raw bytes.
-- `gate_account(account, data, indexed_slot, max_slot_lag, fetcher)` is the
-  same gate as `karat account`: shape those exact bytes, then reconcile only
-  if that is Pass. `examples/account_gate.rs` is the call sequence, not an
-  indexer (`cargo run --example account_gate`).
+```rust
+use karat67::carbon::KaratDecoder;
+
+builder.account(KaratDecoder::new(PROGRAM_ID, KaminoLendingDecoder), processor)
+```
+
+Carbon reads a decoder's `None` as "not my account" and skips it silently,
+so an empty or truncated payload never shows up anywhere. Borsh also decodes
+an over-long payload without complaint. The wrapper closes both gaps:
+
+- A registered type at the wrong length is dropped before the processor sees it.
+- An account the program owns but its decoder could not decode is counted,
+  separately from accounts that belong to other programs.
+- A type karat has no spec for passes through and is counted as unchecked,
+  never as checked.
+
+The counters (`karat_accounts_checked_total`, `karat_accounts_rejected_total`,
+`karat_accounts_unchecked_total`, `karat_decode_failures_total`) register with
+Carbon's `MetricsRegistry`, so the pipeline's existing log or Prometheus
+exporter reports them. The feature needs Rust 1.96.1 or later (Carbon 2's
+minimum) and is off by default.
+
+`examples/carbon-kamino` runs Carbon's own Kamino Lend decoder, with and
+without the wrapper, on a live mainnet Obligation and three corrupted copies:
+
+```
+$ cargo run --manifest-path examples/carbon-kamino/Cargo.toml
+  payload                  Carbon alone   with karat
+  live Obligation          decoded        decoded
+  empty payload            dropped        dropped
+  truncated by 24 bytes    dropped        dropped
+  16 bytes too long        decoded        dropped
+
+  karat_accounts_checked_total     1
+  karat_accounts_rejected_total    1
+  karat_accounts_unchecked_total   0
+  karat_decode_failures_total      2
+```
+
+Without the feature, [`KaratIntegrityProcessor`](src/carbon.rs) runs the same
+checks from any decode path with no Carbon dependency: `check_account` is the
+shape check, and `gate_account` is the same gate as `karat account`
+(`cargo run --example account_gate`).
 
 ## MCP
 
@@ -156,7 +193,6 @@ cargo run --quiet --bin karat-mcp
   carries a `LenRule`. Coverage of a snapshot is not an "accounts for all"
   claim. Automated IDL ingest, so a table is generated rather
   than measured, is the next real step.
-- Carbon metrics emission for processor results.
 - Broader agent workflows on top of the shipped `check_account` MCP tool.
 
 Designed to plug into [Carbon](https://github.com/sevenlabs-hq/carbon)

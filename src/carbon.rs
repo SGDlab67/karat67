@@ -1,7 +1,12 @@
-//! Adapter for running karat integrity checks inside a Carbon-style processor.
+//! Running karat integrity checks inside a Carbon pipeline.
 //!
-//! No Carbon crate dependency: a pipeline calls these methods with decoded
-//! bytes and, when it has one, an [`AccountFetcher`](crate::fetch::AccountFetcher).
+//! [`KaratIntegrityProcessor`] has no Carbon crate dependency: any decode path
+//! calls it with bytes and, when it has one, an
+//! [`AccountFetcher`](crate::fetch::AccountFetcher).
+//!
+//! With the `carbon` feature, `KaratDecoder` wraps a real Carbon 2
+//! `AccountDecoder`, so a pipeline gets the shape gate by changing one line:
+//! `.account(KaratDecoder::new(PROGRAM_ID, decoder), processor)`.
 use crate::checks::shape::check_shape;
 use crate::checks::specs;
 use crate::fetch::AccountFetcher;
@@ -31,6 +36,183 @@ impl KaratIntegrityProcessor {
         fetcher: &dyn AccountFetcher,
     ) -> Vec<CheckResult> {
         crate::gate::check_account(account, data, indexed_slot, max_slot_lag, Some(fetcher))
+    }
+}
+
+#[cfg(feature = "carbon")]
+pub use pipeline::KaratDecoder;
+
+#[cfg(feature = "carbon")]
+mod pipeline {
+    use crate::checks::shape::check_shape;
+    use crate::checks::specs::find_by_discriminator;
+    use crate::report::Status;
+    use carbon_core::account::{AccountDecoder, DecodedAccount};
+    use carbon_core::metrics::{Counter, MetricsRegistry};
+    use solana_pubkey::Pubkey;
+    use std::sync::Once;
+
+    pub(super) static CHECKED: Counter = Counter::new(
+        "karat_accounts_checked_total",
+        "Decoded accounts whose bytes passed the karat shape check",
+    );
+    pub(super) static REJECTED: Counter = Counter::new(
+        "karat_accounts_rejected_total",
+        "Decoded accounts dropped because their bytes failed the karat shape check",
+    );
+    pub(super) static UNCHECKED: Counter = Counter::new(
+        "karat_accounts_unchecked_total",
+        "Decoded accounts passed through because karat has no spec for their type",
+    );
+    pub(super) static DECODE_FAILURES: Counter = Counter::new(
+        "karat_decode_failures_total",
+        "Accounts owned by the program that its decoder could not decode",
+    );
+
+    /// Wraps a Carbon `AccountDecoder` so only accounts with a verified shape
+    /// reach the processor, and so the accounts Carbon drops get counted.
+    ///
+    /// Carbon reads a decoder's `None` as "not my account" and skips it with
+    /// no log and no metric. For an account the program owns, `None` means the
+    /// bytes did not decode: an empty or truncated payload disappears there.
+    /// `karat_decode_failures_total` counts exactly those, separately from
+    /// accounts that belong to some other program (carbon issue #591).
+    ///
+    /// A decoded account is shape-checked against the registry. Pass goes
+    /// through. A registered type at the wrong length is dropped, because borsh
+    /// decodes an over-long payload without complaint. A type karat has no spec
+    /// for goes through and is counted as unchecked, never as checked.
+    ///
+    /// Counters register with Carbon's global `MetricsRegistry`, so the
+    /// pipeline's existing log or Prometheus exporter reports them.
+    // ponytail: no pubkey in the debug log, because Carbon hands a decoder the
+    // account but not its metadata. Wrap the processor too if pubkeys matter.
+    pub struct KaratDecoder<D> {
+        program_id: Pubkey,
+        inner: D,
+    }
+
+    impl<D> KaratDecoder<D> {
+        pub fn new(program_id: Pubkey, inner: D) -> Self {
+            static REGISTER: Once = Once::new();
+            REGISTER.call_once(|| {
+                let registry = MetricsRegistry::global();
+                for counter in [&CHECKED, &REJECTED, &UNCHECKED, &DECODE_FAILURES] {
+                    registry.register_counter(counter);
+                }
+            });
+            Self { program_id, inner }
+        }
+    }
+
+    impl<'a, D: AccountDecoder<'a>> AccountDecoder<'a> for KaratDecoder<D> {
+        type AccountType = D::AccountType;
+
+        fn decode_account(
+            &self,
+            account: &'a solana_account::Account,
+        ) -> Option<DecodedAccount<Self::AccountType>> {
+            let data = account.data.as_slice();
+            let Some(decoded) = self.inner.decode_account(account) else {
+                if account.owner == self.program_id {
+                    DECODE_FAILURES.inc();
+                    log::debug!(
+                        "karat: {} owns a {}-byte account its decoder dropped: {}",
+                        self.program_id,
+                        data.len(),
+                        check_shape(data).detail.unwrap_or_default()
+                    );
+                }
+                return None;
+            };
+
+            let shape = check_shape(data);
+            if shape.status == Status::Pass {
+                CHECKED.inc();
+                return Some(decoded);
+            }
+            let registered = data
+                .get(..8)
+                .and_then(|d| find_by_discriminator(d.try_into().ok()?))
+                .is_some();
+            if !registered && data.len() >= 8 {
+                UNCHECKED.inc();
+                return Some(decoded);
+            }
+            REJECTED.inc();
+            log::debug!(
+                "karat: dropped a decoded {}-byte account: {}",
+                data.len(),
+                shape.detail.unwrap_or_default()
+            );
+            None
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::checks::specs::find_by_account_type;
+
+        /// Stand-in for a Carbon decoder: decodes everything, or nothing.
+        struct Fixed(bool);
+
+        impl<'a> AccountDecoder<'a> for Fixed {
+            type AccountType = ();
+
+            fn decode_account(
+                &self,
+                account: &'a solana_account::Account,
+            ) -> Option<DecodedAccount<()>> {
+                self.0.then_some(DecodedAccount {
+                    lamports: account.lamports,
+                    data: (),
+                    owner: account.owner,
+                    executable: account.executable,
+                    rent_epoch: account.rent_epoch,
+                })
+            }
+        }
+
+        fn account(owner: Pubkey, data: Vec<u8>) -> solana_account::Account {
+            solana_account::Account {
+                lamports: 1,
+                data,
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            }
+        }
+
+        // One test, run in order: the counters are process-wide statics.
+        #[test]
+        fn gates_decoded_accounts_and_counts_owned_drops() {
+            let program = Pubkey::new_from_array([7; 32]);
+            let other = Pubkey::new_from_array([9; 32]);
+            let spec = find_by_account_type("Obligation").unwrap();
+            let mut good = spec.discriminator.to_vec();
+            good.resize(spec.data_len, 0);
+            let mut long = good.clone();
+            long.extend([0; 16]);
+            let unknown = vec![0xAB; 64];
+            let counts = || [&CHECKED, &REJECTED, &UNCHECKED, &DECODE_FAILURES].map(|c| c.get());
+
+            let decodes = KaratDecoder::new(program, Fixed(true));
+            let drops = KaratDecoder::new(program, Fixed(false));
+            let before = counts();
+
+            assert!(decodes.decode_account(&account(program, good)).is_some());
+            assert!(decodes.decode_account(&account(program, long)).is_none());
+            assert!(decodes.decode_account(&account(program, unknown)).is_some());
+            assert!(drops.decode_account(&account(program, vec![])).is_none());
+            assert!(drops.decode_account(&account(other, vec![])).is_none());
+
+            let after = counts();
+            let delta: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+            // checked, rejected, unchecked, decode failures. The account owned
+            // by another program is "not mine" and counts nowhere.
+            assert_eq!(delta, [1, 1, 1, 1]);
+        }
     }
 }
 

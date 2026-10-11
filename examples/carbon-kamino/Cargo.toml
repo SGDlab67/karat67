@@ -1,0 +1,14 @@
+# Its own package so Carbon's Kamino decoder never enters karat67's
+# dev-dependencies and `cargo test` on the crate stays fast.
+[package]
+name = "karat67-carbon-kamino"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+karat67 = { path = "../..", features = ["carbon"] }
+carbon-core = { version = "2", default-features = false }
+carbon-kamino-lending-decoder = "2"
+solana-account = "4"
