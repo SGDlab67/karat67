@@ -56,7 +56,9 @@
 //! `Oracle`, `Operator` and `TokenBadge` are registered at most once for that
 //! reason, and an unregistered program that reuses a registered name (say a
 //! `Position` from a program other than Whirlpool) is judged against the
-//! registered program's rule.
+//! registered program's rule. Across Carbon's decoders, 106 of 263 account
+//! types share a discriminator with another program
+//! (`evidence/carbon-discriminators.md`).
 // ponytail: discriminator-only lookup. Key on (owner, discriminator) once a
 // caller always has the owner; `KaratDecoder` does, the CLI does only via RPC.
 
