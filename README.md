@@ -10,6 +10,10 @@ or malformed accounts, and every dashboard, risk engine, and AI agent built
 on that data inherits the error. `karat67` is an open-source Rust crate and
 CLI that checks indexed data against the chain.
 
+Try the shape gate in the browser, no install:
+[sgdlab67.github.io/karat67](https://sgdlab67.github.io/karat67/). The page
+runs this crate compiled to WebAssembly.
+
 ## Checks
 
 1. **Shape** - account data length and discriminator against the program IDL.
@@ -28,6 +32,9 @@ CLI that checks indexed data against the chain.
    for a window, not a contiguous slot range. Leaders skip slots; heights
    omitted by `getBlocks` are not gaps. Missing = produced slots minus
    indexed. Catches dropped slots that look healthy under green liveness.
+4. **Orphans** - the mirror of completeness: indexed slots inside the window
+   that `getBlocks` never produced. Catches state written for a slot that was
+   skipped or forked away, which is what indexing at `processed` risks.
 
 Freshness and liveness are out of scope by design: every indexer already
 has them.
@@ -74,14 +81,18 @@ karat completeness \
   --end 250000100 \
   --slots 250000000,250000001,250000003 \
   --slot 250000004
+
+# Orphans: same flags as completeness (RPC from --rpc-url or KARAT_RPC_URL),
+# asking the reverse question.
+karat orphans --start 250000000 --end 250000100 --slots 250000000,250000002
 ```
 
-On a terminal, `shape` and `completeness` print a readable report; piped (or
-with `--json`) they print JSON. `reconcile` and `account` print JSON
-results (one object per check). `account` runs shape on the decoded bytes
-and, only when that is Pass, the reconcile check for that account — both
-objects are printed when reconcile runs. All of these exit non-zero unless
-every check is `Pass`. `Fail` and `Skipped` (including slot-lag and unreachable
+On a terminal, `shape`, `account`, `completeness` and `orphans` print a
+readable report; piped (or with `--json`) they print JSON, one object per
+check. `reconcile` always prints JSON. `account` runs shape on the decoded
+bytes and, only when that is Pass, the reconcile check for that account, so a
+bad payload never costs an RPC call. All of these exit non-zero unless every
+check is `Pass`. `Fail` and `Skipped` (including slot-lag and unreachable
 fetch) both fail the process, so they can be wired into pipeline checks and CI
 directly. On a byte
 mismatch, `reconcile` reports the offending account, the indexed vs on-chain
@@ -194,8 +205,14 @@ cargo run --quiet --bin karat-mcp
   `AccountSpec` carries a `LenRule`. And a discriminator names a struct, not a
   program: DLMM and Whirlpool both define `Oracle` at different lengths, so
   lookup has to key on the owner before either can be registered. Coverage of
-  a snapshot is not an "accounts for all" claim. Automated IDL ingest, so a
-  table is generated rather than measured, is the next real step.
+  a snapshot is not an "accounts for all" claim.
+- Owner-aware lookup, keyed on `(program, discriminator)`. Across Carbon's
+  decoders, 106 of 263 account types share a discriminator with another
+  program ([evidence](evidence/carbon-discriminators.md)), and 5 registered
+  types are among them.
+- Generated specs: `evidence/carbon-account-discriminators.csv` already holds
+  every discriminator in Carbon's 63 decoders; lengths still need measuring on
+  live accounts before a row joins the registry.
 - Broader agent workflows on top of the shipped `check_account` MCP tool.
 
 Designed to plug into [Carbon](https://github.com/sevenlabs-hq/carbon)
@@ -211,6 +228,11 @@ the Colosseum Crypto World's Fair 2026.
 ```bash
 bash demo/worlds_fair.sh
 ```
+
+Fetches a live Kamino Obligation and a fresh slot window from mainnet, checks
+every beat off screen first, then steps through four checks on Enter: an
+empty payload, the live bytes, the live bytes with one byte flipped, and a
+slot window with three slots dropped. See [`demo/README.md`](demo/README.md).
 
 ## License
 
