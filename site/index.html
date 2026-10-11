@@ -413,18 +413,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install karat
+        run: cargo install --locked --git https://github.com/SGDlab67/karat67 karat67
       - name: Shape check, no RPC
-        run: cargo run --release --bin karat -- shape --account-type Obligation --len 3344</code></pre>
+        run: karat shape --account-type Obligation --len 3344</code></pre>
         </div>
         <p class="field-hint">
-          Or start from
-          <code>.github/workflows/shape-check.example.yml</code> in the repo.
+          karat67 is not on crates.io yet, so both snippets install from
+          GitHub.
         </p>
 
         <h3 class="sub-title">Or call the crate</h3>
         <div class="codeblock">
           <button type="button" class="copy-btn" data-copy="cargo-add">Copy</button>
-          <pre id="cargo-add"><code>cargo add karat67</code></pre>
+          <pre id="cargo-add"><code>cargo add karat67 --git https://github.com/SGDlab67/karat67</code></pre>
         </div>
       </div>
     </section>
