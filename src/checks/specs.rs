@@ -46,6 +46,19 @@
 //! exists or an Exact zero-count row is added deliberately. A future reader
 //! adding a type still needs the name confirmed the same way (matching
 //! `sha256("account:<StructName>")[..8]`), not inferred from the size.
+//!
+//! # Name reuse across programs
+//!
+//! An Anchor discriminator depends only on the struct name, so two programs
+//! that both define `Oracle` (Meteora DLMM at 3,232 bytes, Orca Whirlpool at
+//! 254) share one discriminator. Lookup here takes bytes alone, without the
+//! owning program, so a reused name can only be registered for one program.
+//! `Oracle`, `Operator` and `TokenBadge` are registered at most once for that
+//! reason, and an unregistered program that reuses a registered name (say a
+//! `Position` from a program other than Whirlpool) is judged against the
+//! registered program's rule.
+// ponytail: discriminator-only lookup. Key on (owner, discriminator) once a
+// caller always has the owner; `KaratDecoder` does, the CLI does only via RPC.
 
 /// How an account type's `data_len` constrains an observed payload.
 ///
@@ -236,9 +249,164 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
     },
 ];
 
+/// Meteora DLMM account specs, program
+/// `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`.
+///
+/// Names and discriminators come from the carbon `meteora-dlmm-decoder` and
+/// match `sha256("account:<Name>")[..8]`. Lengths were measured on mainnet-beta
+/// on 2026-10-11: "swept" means a `getProgramAccounts` scan of every account
+/// with that discriminator, "one pool" means every account of that type
+/// belonging to pool `2Dmu9a9qWcgRS5U5pyUkvtyFrkmFq4hFnK4aLLNQXsCJ`.
+pub const METEORA_DLMM_ACCOUNTS: &[AccountSpec] = &[
+    AccountSpec {
+        program: "Meteora DLMM",
+        account_type: "LbPair",
+        discriminator: [33, 11, 49, 98, 181, 101, 177, 13],
+        // Swept: 163,843 accounts, all 904 bytes.
+        data_len: 904,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Meteora DLMM",
+        account_type: "BinArray",
+        discriminator: [92, 142, 92, 220, 5, 148, 70, 181],
+        // Fixed layout (`bins: [Bin; 70]`), too many accounts to sweep on a
+        // public endpoint: 48 from 30 recent transactions plus 7 in one pool,
+        // all 10,136 bytes.
+        data_len: 10136,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Meteora DLMM",
+        account_type: "PositionV2",
+        discriminator: [117, 176, 212, 199, 245, 180, 133, 182],
+        // Variable length: 8,120 bytes covers 70 bins, and an extended position
+        // adds 112 bytes per extra bin. One pool: 13 of 17 at 8,120, the rest
+        // at 9,240 / 16,072 / 17,528 / 27,720, each 8,120 + k * 112. The
+        // floor is the fixed layout (8 + 8,112 after repr(C) padding), not the
+        // smallest length observed.
+        data_len: 8120,
+        len_rule: LenRule::AtLeast,
+    },
+    AccountSpec {
+        program: "Meteora DLMM",
+        account_type: "BinArrayBitmapExtension",
+        discriminator: [80, 111, 124, 113, 55, 237, 18, 5],
+        // Swept: 6,946 accounts, all 1,576 bytes.
+        data_len: 1576,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Meteora DLMM",
+        account_type: "PresetParameter2",
+        discriminator: [171, 236, 148, 115, 162, 113, 222, 174],
+        // Swept: 392 accounts, all 192 bytes.
+        data_len: 192,
+        len_rule: LenRule::Exact,
+    },
+];
+
+/// Orca Whirlpool account specs, program
+/// `whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc`.
+///
+/// Same provenance as [`METEORA_DLMM_ACCOUNTS`], from the carbon
+/// `orca-whirlpool-decoder`. "One pool" here is Whirlpool
+/// `3wijQvPKm6jHQrAkfPpok5o8WjCWPm1DGG17NmeW8q1w`.
+pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "Whirlpool",
+        discriminator: [63, 149, 209, 12, 225, 128, 99, 9],
+        // Swept: 163,038 accounts, all 653 bytes.
+        data_len: 653,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "Position",
+        discriminator: [170, 188, 143, 228, 122, 64, 247, 208],
+        // Fixed layout, too many to sweep: 20 in one pool, all 216 bytes.
+        // "Position" is a common Anchor name; see the module docs on reuse.
+        data_len: 216,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "TickArray",
+        discriminator: [69, 97, 189, 190, 110, 7, 66, 187],
+        // Fixed layout (`ticks: [Tick; 88]`): 12 from 30 recent transactions
+        // plus 3 in one pool, all 9,988 bytes.
+        data_len: 9988,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "DynamicTickArray",
+        discriminator: [17, 216, 246, 142, 225, 199, 218, 56],
+        // Variable length: 60 fixed bytes plus 88 ticks of 1 byte each when
+        // uninitialized, 113 when initialized. 148 is that empty layout, and
+        // every length seen (148, 260, 1,268, 1,380, ... 9,892) is
+        // 148 + k * 112.
+        data_len: 148,
+        len_rule: LenRule::AtLeast,
+    },
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "FeeTier",
+        discriminator: [56, 75, 159, 76, 142, 68, 190, 105],
+        // Swept: 673 accounts, all 44 bytes.
+        data_len: 44,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "WhirlpoolsConfig",
+        discriminator: [157, 20, 49, 224, 217, 87, 193, 254],
+        // Swept: 508 accounts, all 108 bytes.
+        data_len: 108,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "WhirlpoolsConfigExtension",
+        discriminator: [2, 99, 215, 163, 240, 26, 153, 58],
+        // Swept: 197 accounts, all 616 bytes.
+        data_len: 616,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "AdaptiveFeeTier",
+        discriminator: [147, 16, 144, 116, 47, 146, 149, 46],
+        // Swept: 17 accounts, all 256 bytes.
+        data_len: 256,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "LockConfig",
+        discriminator: [106, 47, 238, 159, 124, 12, 160, 192],
+        // Swept: 1,706 accounts, all 241 bytes.
+        data_len: 241,
+        len_rule: LenRule::Exact,
+    },
+    AccountSpec {
+        program: "Orca Whirlpool",
+        account_type: "PositionBundle",
+        discriminator: [129, 169, 175, 65, 185, 95, 32, 100],
+        // Swept: 225 accounts, all 136 bytes.
+        data_len: 136,
+        len_rule: LenRule::Exact,
+    },
+];
+
 /// Every registered spec across all program tables, in registry order.
 fn all_specs() -> impl Iterator<Item = &'static AccountSpec> {
-    KAMINO_ACCOUNTS.iter().chain(METEORA_DBC_ACCOUNTS)
+    KAMINO_ACCOUNTS
+        .iter()
+        .chain(METEORA_DBC_ACCOUNTS)
+        .chain(METEORA_DLMM_ACCOUNTS)
+        .chain(ORCA_WHIRLPOOL_ACCOUNTS)
 }
 
 /// Look up a registered account by its Anchor discriminator.
@@ -292,6 +460,21 @@ mod tests {
         for spec in METEORA_DBC_ACCOUNTS {
             assert_eq!(spec.program, "Meteora DBC", "{}", spec.account_type);
         }
+        for spec in METEORA_DLMM_ACCOUNTS {
+            assert_eq!(spec.program, "Meteora DLMM", "{}", spec.account_type);
+        }
+        for spec in ORCA_WHIRLPOOL_ACCOUNTS {
+            assert_eq!(spec.program, "Orca Whirlpool", "{}", spec.account_type);
+        }
+    }
+
+    #[test]
+    fn oracle_stays_unregistered_while_lookup_ignores_the_owner() {
+        // DLMM and Whirlpool both name an account `Oracle`, so both share
+        // sha256("account:Oracle")[..8], at 3,232 and 254 bytes. Registering
+        // either would fail every healthy account of the other.
+        let oracle = [139, 194, 131, 179, 140, 179, 229, 244];
+        assert!(find_by_discriminator(oracle).is_none());
     }
 
     #[test]
@@ -404,7 +587,10 @@ mod tests {
         assert!(names.contains(&"VirtualPool"));
         assert_eq!(
             names.len(),
-            KAMINO_ACCOUNTS.len() + METEORA_DBC_ACCOUNTS.len()
+            KAMINO_ACCOUNTS.len()
+                + METEORA_DBC_ACCOUNTS.len()
+                + METEORA_DLMM_ACCOUNTS.len()
+                + ORCA_WHIRLPOOL_ACCOUNTS.len()
         );
     }
 }

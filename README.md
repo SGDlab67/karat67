@@ -38,7 +38,7 @@ has them.
 cargo install --path .
 
 # Shape: check an observed payload against the account registry
-# (Kamino Lend and Meteora DBC).
+# (29 types: Kamino Lend, Meteora DBC, Meteora DLMM, Orca Whirlpool).
 karat shape --account-type UserMetadata --len 1032
 
 # Reconciliation: diff indexed bytes against on-chain state. Pass the RPC
@@ -184,15 +184,18 @@ cargo run --quiet --bin karat-mcp
 
 ## Roadmap
 
-- IDL-driven account specs (done for Kamino Lend and Meteora DBC): new account
-  types are `AccountSpec` data and the `Check` trait is the uniform seam.
-  Adding the second program cost one spec table and zero check code, which was
-  the claim; it also surfaced two things worth recording. Length alone cannot
-  name a type (`VirtualPool` and `TransferHookPool` are both 424 bytes), and
-  not every Anchor account has one legal length, which is why `AccountSpec`
-  carries a `LenRule`. Coverage of a snapshot is not an "accounts for all"
-  claim. Automated IDL ingest, so a table is generated rather
-  than measured, is the next real step.
+- IDL-driven account specs (done for Kamino Lend, Meteora DBC, Meteora DLMM
+  and Orca Whirlpool, 29 types): new account types are `AccountSpec` data and
+  the `Check` trait is the uniform seam. Each program after the first cost one
+  spec table and zero check code, which was the claim; it also surfaced three
+  things worth recording. Length alone cannot name a type (`VirtualPool` and
+  `TransferHookPool` are both 424 bytes). Not every Anchor account has one
+  legal length (DLMM positions grow 112 bytes per extra bin), which is why
+  `AccountSpec` carries a `LenRule`. And a discriminator names a struct, not a
+  program: DLMM and Whirlpool both define `Oracle` at different lengths, so
+  lookup has to key on the owner before either can be registered. Coverage of
+  a snapshot is not an "accounts for all" claim. Automated IDL ingest, so a
+  table is generated rather than measured, is the next real step.
 - Broader agent workflows on top of the shipped `check_account` MCP tool.
 
 Designed to plug into [Carbon](https://github.com/sevenlabs-hq/carbon)

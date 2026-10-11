@@ -24,8 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check an observed account payload against the Kamino account
-    /// registry, by discriminator and exact size.
+    /// Check an observed account payload against the account registry, by
+    /// discriminator and size.
     Shape {
         /// Account type to check against, e.g. `Obligation`.
         #[arg(long)]
