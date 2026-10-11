@@ -14,7 +14,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::checks::reconcile::DEFAULT_MAX_SLOT_LAG;
 use crate::checks::shape::check_shape;
-use crate::checks::specs::{KAMINO_ACCOUNTS, LenRule, METEORA_DBC_ACCOUNTS};
+use crate::checks::specs::{LenRule, all_specs};
 use crate::fetch::MockFetcher;
 use crate::gate::check_account;
 
@@ -90,9 +90,7 @@ pub fn check_account_json(
 /// compiled registry makes that drift impossible.
 #[wasm_bindgen]
 pub fn specs_json() -> String {
-    let specs: Vec<_> = KAMINO_ACCOUNTS
-        .iter()
-        .chain(METEORA_DBC_ACCOUNTS)
+    let specs: Vec<_> = all_specs()
         .map(|spec| {
             serde_json::json!({
                 "program": spec.program,

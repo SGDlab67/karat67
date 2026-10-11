@@ -403,7 +403,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
 ];
 
 /// Every registered spec across all program tables, in registry order.
-fn all_specs() -> impl Iterator<Item = &'static AccountSpec> {
+pub fn all_specs() -> impl Iterator<Item = &'static AccountSpec> {
     KAMINO_ACCOUNTS
         .iter()
         .chain(METEORA_DBC_ACCOUNTS)

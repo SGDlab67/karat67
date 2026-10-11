@@ -9,10 +9,12 @@ import init, {
   shape_json,
   specs_json,
   check_account_json,
-  default_max_slot_lag,
 } from "./pkg/karat67.js";
 
 const ENDPOINT_KEY = "karat67.rpc_endpoint";
+// Free, keyless, and allows browser requests. The Solana Foundation endpoint
+// answers 403 to any request carrying a web Origin, so it cannot serve here.
+const PUBLIC_RPC = "https://solana-rpc.publicnode.com";
 
 const el = {
   form: document.getElementById("gate-form"),
@@ -25,6 +27,9 @@ const el = {
   run: document.getElementById("run-gate"),
   out: document.getElementById("gate-out"),
   advanced: document.getElementById("advanced"),
+  livePicker: document.getElementById("live-picker"),
+  preset: document.getElementById("preset"),
+  damage: document.getElementById("damage"),
   idlLabel: document.getElementById("idl-label"),
   idlCount: document.getElementById("idl-count"),
   idlBar: document.getElementById("bar-idl"),
@@ -101,6 +106,24 @@ const CASES = {
   },
 };
 
+// What the stand-in indexer stored, given the bytes it read.
+const DAMAGE = {
+  none: { name: "none", apply: (b) => b },
+  flip: {
+    name: "one byte flipped at offset 100",
+    apply: (b) => {
+      const c = b.slice();
+      c[Math.min(100, c.length - 1)] ^= 0xff;
+      return c;
+    },
+  },
+  truncate: {
+    name: "cut 24 bytes short",
+    apply: (b) => b.slice(0, Math.max(0, b.length - 24)),
+  },
+  empty: { name: "an empty row", apply: () => new Uint8Array(0) },
+};
+
 const selectedCase = () =>
   document.querySelector('input[name="case"]:checked')?.value ?? "healthy";
 
@@ -124,6 +147,30 @@ function write(lines) {
   el.out.innerHTML = lines.join("");
 }
 
+/** Reconcile details are JSON. Same wording as `describe` in the CLI;
+ *  anything that does not parse prints raw. */
+function describe(detail) {
+  let v;
+  try {
+    v = JSON.parse(detail);
+  } catch {
+    return [detail];
+  }
+  if (typeof v?.first_diff_offset !== "number") return [detail];
+  const lines =
+    v.reason === "slot lag"
+      ? [
+          `bytes differ at offset ${v.first_diff_offset}, indexer ${v.lag} slots behind`,
+          "inside the slot-lag window: recheck, do not trust yet",
+        ]
+      : [
+          `bytes differ from chain at offset ${v.first_diff_offset}`,
+          `indexed ${v.indexed_len} bytes, on-chain ${v.onchain_len} bytes`,
+        ];
+  lines.push(`chain read at slot ${v.context_slot}`);
+  return lines;
+}
+
 function renderResults(results, header, notes = []) {
   const lines = [line("line-head", header)];
   for (const note of notes) lines.push(line("line-muted", note));
@@ -136,7 +183,9 @@ function renderResults(results, header, notes = []) {
         `${ICON[r.status] ?? "????"}  ${r.check}`,
       ),
     );
-    if (r.detail) lines.push(line("line-muted", `      ${r.detail}`));
+    for (const d of r.detail ? describe(r.detail) : []) {
+      lines.push(line("line-muted", `      ${d}`));
+    }
   }
 
   // Mirrors karat67::gate::all_pass: non-empty and every status Pass.
@@ -282,7 +331,7 @@ function storeEndpoint(value) {
 function refreshEndpointState() {
   const value = el.rpc.value.trim();
   if (!value) {
-    el.endpointState.textContent = "none set";
+    el.endpointState.textContent = `${new URL(PUBLIC_RPC).host} (default)`;
     return;
   }
   let host = value;
@@ -355,24 +404,13 @@ function customPayload() {
 
 function caseChanged(animate) {
   const id = selectedCase();
+  el.livePicker.hidden = id !== "live";
   if (id === "live") {
-    el.advanced.open = true;
     pendingField();
     write([
-      line(
-        "line-muted",
-        "Live case. Give an account pubkey and your RPC endpoint",
-      ),
-      line(
-        "line-muted",
-        "under your own payload and endpoint, then run the gate.",
-      ),
-      line("line-muted", ""),
-      line(
-        "line-muted",
-        "This site hosts no RPC and has no backend. Your provider must",
-      ),
-      line("line-muted", "allow browser requests (CORS) from this origin."),
+      line("line-muted", "Live case. Pick an account and what the indexer stored,"),
+      line("line-muted", "then run the gate. Reads go from this tab to"),
+      line("line-muted", `${el.endpointState.textContent}.`),
     ]);
     return;
   }
@@ -406,20 +444,12 @@ function caseChanged(animate) {
 // --------------------------------------------------------------------- gate
 
 async function runLive(endpoint) {
-  const account = el.account.value.trim();
+  const account = el.preset.value || el.account.value.trim();
   if (!account) {
     el.advanced.open = true;
     renderError(
       "the live case needs an account pubkey",
       "add one under your own payload and endpoint",
-    );
-    return;
-  }
-  if (!endpoint) {
-    el.advanced.open = true;
-    renderError(
-      "the live case needs an RPC endpoint",
-      "this site hosts none, so the fetch uses the endpoint you supply",
     );
     return;
   }
@@ -443,37 +473,40 @@ async function runLive(endpoint) {
     return;
   }
 
-  write([line("line-muted", `fetching ${account} ...`)]);
-  const fetched = await fetchAccount(endpoint, account);
-  const contextSlot = BigInt(fetched.contextSlot);
-
-  if (!custom && fetched.data === null) {
-    renderError(
-      `no account at ${account} as of context slot ${fetched.contextSlot}`,
-      "the gate needs bytes to shape; paste the row your indexer wrote",
-    );
-    return;
-  }
-
-  const indexed = custom ?? fetched.data;
-  drawField(indexed, null, false);
+  write([line("line-muted", `reading ${account} ...`)]);
+  const notes = [];
+  let indexed = custom;
+  let fallback = null;
 
   // Reconcile needs two independent sides: what the index stored and what the
-  // chain holds. With no indexed payload there is only one, and comparing the
-  // fetch against itself would pass every time. That is the green-while-blind
-  // verdict this gate exists to refuse, so shape the fetched bytes instead and
-  // say plainly that reconcile did not run.
+  // chain holds. Comparing one read against itself would pass every time, the
+  // green-while-blind verdict this gate exists to refuse. With no pasted
+  // payload the page plays the indexer: a first read is the stored copy, the
+  // chosen damage is applied to it, and a second read is the chain.
   if (!custom) {
-    renderResults(
-      JSON.parse(shape_json(indexed)),
-      `karat shape ${account}, fetched at context slot ${fetched.contextSlot}`,
-      [
-        "Shape only. Reconcile compares the bytes your index stored against the",
-        "bytes on chain, so it needs your side too: paste the indexed payload",
-        "above to run it.",
-      ],
+    const stored = await fetchAccount(endpoint, account);
+    if (stored.data === null) {
+      renderError(
+        `no account at ${account} as of context slot ${stored.contextSlot}`,
+        "the gate needs bytes to shape; paste the row your indexer wrote",
+      );
+      return;
+    }
+    const damage = DAMAGE[el.damage.value] ?? DAMAGE.none;
+    indexed = damage.apply(stored.data);
+    fallback = findSpec(stored.data);
+    notes.push(
+      `Stored copy: read at slot ${stored.contextSlot}, ${bytes(stored.data.length)}, damage: ${damage.name}.`,
     );
-    return;
+  }
+
+  const fetched = await fetchAccount(endpoint, account);
+  drawField(indexed, fallback, true);
+  if (!custom) {
+    notes.push(`Chain: read again at slot ${fetched.contextSlot}.`);
+  }
+  if (indexedSlot === undefined) {
+    notes.push("No write slot, so any byte difference fails, never skips as lag.");
   }
 
   const json = check_account_json(
@@ -481,17 +514,17 @@ async function runLive(endpoint) {
     indexed,
     indexedSlot,
     fetched.data ?? undefined,
-    contextSlot,
+    BigInt(fetched.contextSlot),
     undefined,
   );
   renderResults(
     JSON.parse(json),
-    `karat account ${account}, shape then reconcile, max slot lag ${default_max_slot_lag()}`,
-    [],
+    `karat account ${account}, shape then reconcile`,
+    notes,
   );
 }
 
-function runConstructed(id, endpoint) {
+function runConstructed(id) {
   let custom;
   try {
     custom = customPayload();
@@ -510,9 +543,7 @@ function runConstructed(id, endpoint) {
   const notes = [];
   if (custom) notes.push("Your pasted payload, not the selected case.");
   else notes.push(`Constructed in this page, not fetched from chain.`);
-  if (endpoint) {
-    notes.push("Shape alone. Select the live case to reconcile against chain.");
-  }
+  notes.push("Shape alone. Select the live case to reconcile against chain.");
 
   // shape_json, not check_account_json: there is no chain account for a
   // constructed payload, so reconcile is not merely skipped, it cannot run.
@@ -533,15 +564,16 @@ async function runGate(event) {
     return;
   }
 
-  const endpoint = el.rpc.value.trim();
-  storeEndpoint(endpoint);
+  const typed = el.rpc.value.trim();
+  storeEndpoint(typed);
   refreshEndpointState();
+  const endpoint = typed || PUBLIC_RPC;
 
   const id = selectedCase();
   el.run.disabled = true;
   try {
     if (id === "live") await runLive(endpoint);
-    else runConstructed(id, endpoint);
+    else runConstructed(id);
   } catch (error) {
     const message = error?.message ?? String(error);
     const looksLikeCors =

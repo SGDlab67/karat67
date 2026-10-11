@@ -228,6 +228,19 @@ a:hover {
   box-shadow: inset 3px 0 0 var(--brass);
 }
 
+/* Continues the selected live case: same fill and rule, aligned to its text. */
+.live-picker {
+  display: grid;
+  gap: 0.9rem;
+  padding: 0 0.9rem 0.9rem 3.1rem;
+  background: var(--paper);
+  box-shadow: inset 3px 0 0 var(--brass);
+}
+
+.live-picker[hidden] {
+  display: none;
+}
+
 .case-dot {
   grid-row: span 2;
   align-self: start;
@@ -525,6 +538,7 @@ a:hover {
 }
 
 .field input,
+.field select,
 .field textarea {
   font-family: var(--mono);
   font-size: 0.84rem;
@@ -542,6 +556,7 @@ a:hover {
 }
 
 .field input:focus-visible,
+.field select:focus-visible,
 .field textarea:focus-visible {
   outline: none;
   border-color: var(--brass);

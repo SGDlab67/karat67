@@ -48,7 +48,7 @@
           <div class="panel">
             <div class="panel-head">
               <h2 class="panel-title" id="cases-title">Pick a case</h2>
-              <p class="panel-note">Four constructed, one live</p>
+              <p class="panel-note">One live, four constructed</p>
             </div>
 
             <ul class="cases" role="list">
@@ -57,9 +57,61 @@
                   class="case-input"
                   type="radio"
                   name="case"
+                  id="case-live"
+                  value="live"
+                  checked
+                />
+                <label class="case-label" for="case-live">
+                  <span class="case-dot" aria-hidden="true"></span>
+                  <span class="case-name">Live account from chain</span>
+                  <span class="case-desc">
+                    A real mainnet account from Kamino, Meteora or Orca, read in
+                    this tab. Damage the stored copy and watch the full gate,
+                    shape then reconcile, catch it.
+                    <span class="case-origin" data-origin="live"
+                      >fetched from chain</span
+                    >
+                  </span>
+                </label>
+                <div class="live-picker" id="live-picker" hidden>
+                  <div class="field">
+                    <label class="field-label" for="preset">Account</label>
+                    <select id="preset" name="preset">
+                      <option value="2AHc6PtJftXmfbNvkvPfpuWzV7LvRTJCutzWqgMJKVpq">Kamino Lend, Obligation</option>
+                      <option value="HS4hNEtnKNqxySvJ6cdEVyeNPKxzimEx7igtLfC8CtyX">Meteora DLMM, LbPair pool</option>
+                      <option value="DesueGSXbxt7fNTAcdJLXGdcRwi7e7fWTmuJQaM4y13s">Meteora DBC, VirtualPool</option>
+                      <option value="8huhB8wenBXpcVHafo5Mn4QqcM9Sxe8kjh4rYWykKeag">Orca, Whirlpool pool</option>
+                      <option value="">Your own pubkey, set below</option>
+                    </select>
+                    <p class="field-hint">
+                      Real mainnet accounts, picked because nothing has written to
+                      them in months, so the two reads below agree.
+                    </p>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="damage">What the indexer stored</label>
+                    <select id="damage" name="damage">
+                      <option value="none">The bytes as read</option>
+                      <option value="flip">One byte flipped</option>
+                      <option value="truncate">Cut 24 bytes short</option>
+                      <option value="empty">Nothing, an empty row</option>
+                    </select>
+                    <p class="field-hint">
+                      The page plays your indexer: it reads the account once as the
+                      stored copy, applies this damage, then reads it again as the
+                      chain.
+                    </p>
+                  </div>
+                </div>
+              </li>
+
+              <li class="case">
+                <input
+                  class="case-input"
+                  type="radio"
+                  name="case"
                   id="case-healthy"
                   value="healthy"
-                  checked
                 />
                 <label class="case-label" for="case-healthy">
                   <span class="case-dot" aria-hidden="true"></span>
@@ -135,27 +187,6 @@
                     TransferHookPool.
                     <span class="case-origin" data-origin="constructed"
                       >constructed in this page</span
-                    >
-                  </span>
-                </label>
-              </li>
-
-              <li class="case">
-                <input
-                  class="case-input"
-                  type="radio"
-                  name="case"
-                  id="case-live"
-                  value="live"
-                />
-                <label class="case-label" for="case-live">
-                  <span class="case-dot" aria-hidden="true"></span>
-                  <span class="case-name">Live account from chain</span>
-                  <span class="case-desc">
-                    You supply a pubkey and your own RPC endpoint. Runs the full
-                    gate, shape then reconcile.
-                    <span class="case-origin" data-origin="live"
-                      >fetched from chain</span
                     >
                   </span>
                 </label>
@@ -256,10 +287,12 @@
                     placeholder="https://your-endpoint.example/..."
                   />
                   <p class="field-hint">
-                    This site hosts no RPC and has no backend, so the endpoint
-                    is sent only to the host you type here and is kept in this
-                    browser's <code>localStorage</code>. Your provider must
-                    allow browser requests (CORS) from this origin.
+                    Empty means PublicNode's free public endpoint,
+                    <code>solana-rpc.publicnode.com</code>. This site has no
+                    backend, so an endpoint you type goes only to that host and
+                    is kept in this browser's <code>localStorage</code>. Your
+                    provider must allow browser requests (CORS) from this
+                    origin.
                   </p>
                 </div>
 

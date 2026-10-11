@@ -10,9 +10,11 @@ or malformed accounts, and every dashboard, risk engine, and AI agent built
 on that data inherits the error. `karat67` is an open-source Rust crate and
 CLI that checks indexed data against the chain.
 
-Try the shape gate in the browser, no install:
-[sgdlab67.github.io/karat67](https://sgdlab67.github.io/karat67/). The page
-runs this crate compiled to WebAssembly.
+Try it in the browser, no install:
+[sgdlab67.github.io/karat67](https://sgdlab67.github.io/karat67/). Pick a live
+Kamino, Meteora or Orca account, damage the stored copy, and watch shape and
+reconcile catch it. The page runs this crate compiled to WebAssembly and reads
+mainnet through PublicNode's free endpoint, or yours.
 
 ## Checks
 
