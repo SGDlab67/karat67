@@ -1,19 +1,19 @@
-# World's Fair 60s demo script
-
-**Camera path (one command):**
+# World's Fair demo runner
 
 ```bash
+cargo install --path . --locked   # once, puts `karat` on PATH
 bash demo/worlds_fair.sh
 ```
 
-Prints pass (UserMetadata len 1032) then fail (empty payload), with banners for filming.
+The script fetches a live Kamino Obligation and a fresh slot window from
+mainnet, builds a corrupted copy, and runs every beat once off screen. If any
+beat would not produce its expected result, it stops before the camera part.
 
-**~60 seconds, spoken**
+Then it clears the screen. Press Enter to advance each beat:
 
-Hi — this is karat67. Indexers can look perfectly healthy while writing garbage.
+1. `karat account` on an empty payload: shape Fail, no RPC call.
+2. `karat account` on the live bytes: Pass, exit 0.
+3. `karat account` on the live bytes with one byte flipped: reconcile Fail at offset 100.
+4. `karat completeness` with three produced slots dropped: Fail, 3 missing.
 
-**Pass.** Run shape on UserMetadata at the correct length — 1032 bytes. The check passes. Your pipeline can gate on that.
-
-**Fail.** Same account type, zero-byte payload — the silent corruption class we saw in production. Shape fails. Your liveness and freshness dashboards can stay green the whole time; that's why shape exists.
-
-Run `bash demo/worlds_fair.sh` for both steps and acceptance.
+`KARAT_RPC_URL` defaults to the public mainnet endpoint and is never printed.

@@ -276,8 +276,13 @@ fn main() -> anyhow::Result<()> {
                 max_slot_lag,
                 fetcher.as_ref().map(|fetch| fetch as &dyn AccountFetcher),
             );
-            for result in &results {
-                println!("{}", serde_json::to_string_pretty(result)?);
+            if cli.json || !std::io::stdout().is_terminal() {
+                for result in &results {
+                    println!("{}", serde_json::to_string_pretty(result)?);
+                }
+            } else {
+                let color = std::env::var_os("NO_COLOR").is_none();
+                print!("{}", render_account(&account, data.len(), &results, color));
             }
             if !all_pass(&results) {
                 std::process::exit(1);
@@ -400,8 +405,11 @@ fn print_completeness_human(start: u64, end: u64, indexed_len: usize, result: &C
         }
         Status::Fail => {
             let detail = result.detail.as_deref().unwrap_or("missing slots");
-            println!("  {}  {detail}", paint("1;31", "FAIL"));
-            println!("        produced slots from getBlocks are absent from the index");
+            let lines = describe_missing(detail);
+            println!("  {}  {}", paint("1;31", "FAIL"), lines[0]);
+            for line in &lines[1..] {
+                println!("        {line}");
+            }
             println!();
             println!("  exit code 1: a pipeline or CI job stops here");
         }
@@ -462,8 +470,160 @@ fn print_orphans_human(start: u64, end: u64, indexed_len: usize, result: &CheckR
     println!();
 }
 
+/// Terminal report for the account gate: one row per stage, shape then
+/// reconcile, and the exit code a pipeline would see. Pure so it is testable.
+fn render_account(account: &str, len: usize, results: &[CheckResult], color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
+    // Continuation lines line up under the detail column of a stage row.
+    let pad = " ".repeat(19);
+    let mut out = String::new();
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {}  account check · {account}",
+        paint("1;33", "karat67")
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  indexed    {:>6} bytes", group(len));
+    let _ = writeln!(out);
+
+    for result in results {
+        let stage = if result.check.starts_with("reconcile") {
+            "reconcile"
+        } else {
+            "shape"
+        };
+        let tag = match result.status {
+            Status::Pass => paint("1;32", "PASS"),
+            Status::Fail => paint("1;31", "FAIL"),
+            Status::Skipped => paint("1;33", "SKIP"),
+        };
+        let lines = match (result.status, result.detail.as_deref()) {
+            (Status::Pass, _) if stage == "shape" => vec![format!(
+                "{} layout matches the IDL",
+                result
+                    .check
+                    .trim_start_matches("shape(")
+                    .trim_end_matches(')')
+            )],
+            (Status::Pass, _) => vec!["indexed bytes match the chain".to_string()],
+            (_, Some(detail)) => describe(detail),
+            (_, None) => vec!["no detail".to_string()],
+        };
+        let _ = writeln!(out, "  {stage:<9}  {tag}  {}", lines[0]);
+        for line in &lines[1..] {
+            let _ = writeln!(out, "{pad}{line}");
+        }
+    }
+    if results.len() == 1 && results[0].status != Status::Pass {
+        let _ = writeln!(
+            out,
+            "  reconcile        not run: shape failed, no RPC call made"
+        );
+    }
+
+    let _ = writeln!(out);
+    if all_pass(results) {
+        let _ = writeln!(out, "  exit code 0: safe to decode and use");
+    } else if results.iter().any(|r| r.status == Status::Fail) {
+        let _ = writeln!(out, "  exit code 1: a pipeline or CI job stops here");
+    } else {
+        let _ = writeln!(out, "  exit code 1: Skipped is never green");
+    }
+    let _ = writeln!(out);
+    out
+}
+
+/// Reconcile details are JSON strings; turn the known fields into short
+/// lines. Anything else (missing account, unreachable RPC) is word-wrapped.
+fn describe(detail: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(detail) else {
+        return wrap(detail, 60);
+    };
+    let num = |key: &str| v[key].as_u64().map(group).unwrap_or_else(|| "?".into());
+    let mut lines = Vec::new();
+    if v["reason"] == "slot lag" {
+        lines.push(format!(
+            "bytes differ at offset {}, indexer {} slots behind",
+            num("first_diff_offset"),
+            num("lag")
+        ));
+        lines.push("inside the slot-lag window: recheck, do not trust yet".into());
+    } else {
+        lines.push(format!(
+            "bytes differ from chain at offset {}",
+            num("first_diff_offset")
+        ));
+        lines.push(format!(
+            "indexed {} bytes, on-chain {} bytes",
+            num("indexed_len"),
+            num("onchain_len")
+        ));
+    }
+    lines.push(format!("chain read at slot {}", num("context_slot")));
+    lines
+}
+
+/// Completeness Fail details are JSON: count plus the first missing slots.
+/// Anything that does not parse is printed raw, word-wrapped.
+fn describe_missing(detail: &str) -> Vec<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(detail).ok();
+    let Some(v) = parsed.filter(|v| v["missing_count"].is_u64()) else {
+        return wrap(detail, 60);
+    };
+    let count = v["missing_count"].as_u64().unwrap_or_default();
+    let sample: Vec<String> = v["missing_sample"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|slot| slot.as_u64())
+        .map(group)
+        .collect();
+    let label = if (sample.len() as u64) < count {
+        "first missing:"
+    } else {
+        "missing:"
+    };
+    let mut lines = vec![format!(
+        "{} of {} slots in getBlocks are missing from the index",
+        group(count),
+        v["produced_count"]
+            .as_u64()
+            .map(group)
+            .unwrap_or_else(|| "?".into())
+    )];
+    lines.extend(wrap(&format!("{label} {}", sample.join(" ")), 60));
+    lines
+}
+
+/// Greedy word wrap at `width` columns.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    for word in text.split_whitespace() {
+        let line = lines.last_mut().expect("never empty");
+        if !line.is_empty() && line.len() + 1 + word.len() > width {
+            lines.push(word.to_string());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines
+}
+
 /// 3344 -> "3,344".
-fn group(n: usize) -> String {
+fn group(n: impl std::fmt::Display) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -473,4 +633,43 @@ fn group(n: usize) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_report_names_the_failing_stage() {
+        let empty = [CheckResult::fail(
+            "shape",
+            "empty payload: 0 bytes, every allocated account starts with an 8-byte discriminator",
+        )];
+        let out = render_account("acct", 0, &empty, false);
+        assert!(out.contains("shape      FAIL  empty payload"));
+        assert!(out.contains("not run: shape failed, no RPC call made"));
+        assert!(out.contains("exit code 1"));
+        assert!(out.lines().all(|line| line.chars().count() <= 80));
+
+        let diff = r#"{"account":"acct","context_slot":455814836,"first_diff_offset":100,"indexed_len":3344,"onchain_len":3344}"#;
+        let mismatch = [
+            CheckResult::pass("shape(Obligation)"),
+            CheckResult::fail("reconcile(acct)", diff),
+        ];
+        let out = render_account("acct", 3344, &mismatch, false);
+        assert!(out.contains("shape      PASS  Obligation layout matches the IDL"));
+        assert!(out.contains("reconcile  FAIL  bytes differ from chain at offset 100"));
+        assert!(out.contains("indexed 3,344 bytes, on-chain 3,344 bytes"));
+        assert!(out.contains("slot 455,814,836"));
+        assert!(!out.contains("not run"));
+
+        let gap = r#"{"end":104,"indexed_count":2,"missing_count":2,"missing_sample":[101,104],"produced_count":4,"start":100}"#;
+        let lines = describe_missing(gap);
+        assert_eq!(
+            lines[0],
+            "2 of 4 slots in getBlocks are missing from the index"
+        );
+        assert_eq!(lines[1], "missing: 101 104");
+        assert_eq!(describe_missing("not json"), vec!["not json"]);
+    }
 }

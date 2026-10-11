@@ -1,35 +1,58 @@
 #!/usr/bin/env bash
-# Camera-friendly 60s World's Fair demo — one command, clear banners.
+# Step-through World's Fair demo: silent prep and preflight, then Enter per beat.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-banner() {
-  printf '\n'
-  printf '══════════════════════════════════════════════════════════\n'
-  printf '  %s\n' "$1"
-  printf '══════════════════════════════════════════════════════════\n'
+command -v karat >/dev/null || { echo "karat not on PATH: run cargo install --path . --locked" >&2; exit 1; }
+export KARAT_RPC_URL="${KARAT_RPC_URL:-https://api.mainnet-beta.solana.com}"
+
+rpc() { curl -sf "$KARAT_RPC_URL" -H 'content-type: application/json' -d "$1"; }
+die() { echo "prep failed: $1" >&2; exit 1; }
+
+PK=BYojGuT56e2TUb8PQwRyT1wL5X5Ekv4kZH1HUQgBu6Zg
+GOOD=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$PK\",{\"encoding\":\"base64\"}]}" |
+  python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["value"]["data"][0])' 2>/dev/null) || die "getAccountInfo $PK"
+BAD=$(python3 -c 'import base64,sys;b=bytearray(base64.b64decode(sys.argv[1]));b[100]^=0xFF;print(base64.b64encode(b).decode())' "$GOOD")
+END=$(rpc '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"finalized"}]}' |
+  python3 -c 'import json,sys;print(json.load(sys.stdin)["result"])' 2>/dev/null) || die "getSlot"
+START=$((END - 100))
+# Drop three produced slots so completeness has something to find.
+SLOTS=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlocks\",\"params\":[$START,$END]}" |
+  python3 -c 'import json,sys;b=json.load(sys.stdin)["result"];assert len(b)>43;print(",".join(map(str,b[:40]+b[43:])))' 2>/dev/null) || die "getBlocks $START..$END"
+
+b1=(karat account --account "$PK" --indexed-base64 "")
+b2=(karat account --account "$PK" --indexed-base64 "$GOOD")
+b3=(karat account --account "$PK" --indexed-base64 "$BAD")
+b4=(karat completeness --start "$START" --end "$END" --slots "$SLOTS")
+
+# pre <label> pass|fail <cmd...>: a fail beat must exit non-zero with a real
+# Fail, so an RPC hiccup (Skipped) is caught here instead of on camera.
+pre() {
+  local label=$1 want=$2 out code=0; shift 2
+  out=$("$@" 2>&1) || code=$?
+  if [[ $want == pass && $code -eq 0 ]] || [[ $want == fail && $code -ne 0 && $out == *'"status": "Fail"'* ]]; then return; fi
+  echo "preflight failed: $label (exit $code)" >&2; exit 1
 }
+pre "beat 1, empty payload" fail "${b1[@]}"
+pre "beat 2, good payload" pass "${b2[@]}"
+pre "beat 3, bad payload" fail "${b3[@]}"
+pre "beat 4, completeness" fail "${b4[@]}"
 
-banner "karat67 · World's Fair demo"
-echo "  Chain-truth shape gate — not a liveness dashboard"
-echo "  Account: UserMetadata (Kamino Lend)"
+echo "preflight OK, press Enter to start"
+read -rs || true
+clear 2>/dev/null || true
 
-banner "PASS · well-formed UserMetadata · len 1032"
-cargo run --quiet --bin karat -- --json shape --account-type UserMetadata --len 1032
-echo "  → exit 0  shape(UserMetadata) Pass"
+# beat <shown> <cmd...>: wait for Enter, show the command, run it, show exit.
+beat() {
+  local shown=$1 code=0; shift
+  read -rs || true
+  printf '\033[1m$ %s\033[0m\n' "$shown"
+  "$@" || code=$?
+  if ((code == 0)); then printf '\033[32mexit 0\033[0m\n\n'; else printf '\033[31mexit %d\033[0m\n\n' "$code"; fi
+}
+beat 'karat account --account $PK --indexed-base64 ""' "${b1[@]}"
+beat 'karat account --account $PK --indexed-base64 "$GOOD"' "${b2[@]}"
+beat 'karat account --account $PK --indexed-base64 "$BAD"' "${b3[@]}"
+beat 'karat completeness --start $START --end $END --slots "$SLOTS"' "${b4[@]}"
 
-banner "FAIL · empty payload · silent corruption class · len 0"
-set +e
-cargo run --quiet --bin karat -- --json shape --account-type UserMetadata --len 0
-fail_status=$?
-set -e
-if [[ "$fail_status" -eq 0 ]]; then
-  echo "EXPECTED FAIL but got exit 0" >&2
-  exit 1
-fi
-echo "  → exit $fail_status  shape Fail (empty payload)"
-
-banner "ACCEPTANCE OK"
-echo "  Empty payload failed under a green shape check."
-echo "  Liveness can stay green. Shape cannot."
-echo
+echo "github.com/SGDlab67/karat67"
