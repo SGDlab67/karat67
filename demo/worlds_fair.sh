@@ -9,7 +9,10 @@ export KARAT_RPC_URL="${KARAT_RPC_URL:-https://api.mainnet-beta.solana.com}"
 rpc() { curl -sf "$KARAT_RPC_URL" -H 'content-type: application/json' -d "$1"; }
 die() { echo "prep failed: $1" >&2; exit 1; }
 
-PK=BYojGuT56e2TUb8PQwRyT1wL5X5Ekv4kZH1HUQgBu6Zg
+# A dormant Obligation (no transaction in years), the same one the site's
+# Kamino preset uses. An active one changes on chain between preflight and the
+# Pass beat, which then fails on camera.
+PK=2AHc6PtJftXmfbNvkvPfpuWzV7LvRTJCutzWqgMJKVpq
 GOOD=$(rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$PK\",{\"encoding\":\"base64\"}]}" |
   python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["value"]["data"][0])' 2>/dev/null) || die "getAccountInfo $PK"
 BAD=$(python3 -c 'import base64,sys;b=bytearray(base64.b64decode(sys.argv[1]));b[100]^=0xFF;print(base64.b64encode(b).decode())' "$GOOD")
