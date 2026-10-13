@@ -81,6 +81,24 @@ pub enum LenRule {
     AtLeast,
 }
 
+/// One era of a type whose legal length changed at a program upgrade.
+///
+/// A program upgrade can add fields to an account without touching its
+/// discriminator (pump_swap's `Pool` gained `is_mayhem_mode` and
+/// `is_cashback_coin`), so the discriminator still names the type while the
+/// legal length depends on when the account was last written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LenEra {
+    /// First slot this era applies to. Ascending across the list, and the
+    /// first era should start at the program's genesis (0 or its deploy
+    /// slot) so every slot resolves.
+    pub from_slot: u64,
+    /// Legal length during this era: exact or minimum, same meaning as
+    /// [`AccountSpec::data_len`].
+    pub data_len: usize,
+    pub len_rule: LenRule,
+}
+
 /// IDL-declared shape of one account type: its 8-byte Anchor discriminator
 /// and its on-chain size (discriminator included), read as exactly or at
 /// least that many bytes according to `len_rule`.
@@ -96,6 +114,38 @@ pub struct AccountSpec {
     /// minimum legal length when it is [`LenRule::AtLeast`].
     pub data_len: usize,
     pub len_rule: LenRule,
+    /// Legal lengths by slot era, ascending, for a type whose layout changed
+    /// at a program upgrade. A caller that knows a slot resolves through
+    /// [`AccountSpec::len_at`].
+    ///
+    /// Empty (`&[]`, every row unless an upgrade split it) means one rule for
+    /// all time: `data_len` and `len_rule`. `data_len`/`len_rule` always
+    /// describe the current layout, so slot-less checkers (`check_shape`,
+    /// the CLI, `KaratDecoder`) keep judging against what is live now.
+    // ponytail: no slot reaches check_shape today. A consumer that has one
+    // (KaratDecoder sits in a pipeline where AccountUpdate carries the slot,
+    // it just does not pass it) resolves with len_at and checks the era's
+    // rule; that is the next step, and it needs the slot plumbed, not more
+    // data here.
+    pub len_eras: &'static [LenEra],
+}
+
+impl AccountSpec {
+    /// The length rule in force at `slot`.
+    ///
+    /// With no eras this is the unbounded `data_len`/`len_rule`. Otherwise it
+    /// is the last era at or before `slot`; a slot before the first era
+    /// resolves to the earliest known layout, which is why the first era is
+    /// documented to start at genesis.
+    pub fn len_at(&self, slot: u64) -> (usize, LenRule) {
+        if self.len_eras.is_empty() {
+            return (self.data_len, self.len_rule);
+        }
+        match self.len_eras.iter().rev().find(|era| era.from_slot <= slot) {
+            Some(era) => (era.data_len, era.len_rule),
+            None => (self.len_eras[0].data_len, self.len_eras[0].len_rule),
+        }
+    }
 }
 
 /// Kamino Lending account specs — the IDL-informed table shape checks consult.
@@ -110,6 +160,7 @@ pub const KAMINO_ACCOUNTS: &[AccountSpec] = &[
         // OBLIGATION_SIZE 3336 + 8
         data_len: 3344,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Kamino Lend",
@@ -118,6 +169,7 @@ pub const KAMINO_ACCOUNTS: &[AccountSpec] = &[
         // USER_METADATA_SIZE 1024 + 8
         data_len: 1032,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Kamino Lend",
@@ -126,6 +178,7 @@ pub const KAMINO_ACCOUNTS: &[AccountSpec] = &[
         // RESERVE_SIZE 8616 + 8
         data_len: 8624,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Kamino Lend",
@@ -134,6 +187,7 @@ pub const KAMINO_ACCOUNTS: &[AccountSpec] = &[
         // LENDING_MARKET_SIZE 4656 + 8
         data_len: 4664,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
 ];
 
@@ -151,6 +205,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // TransferHookPool below.
         data_len: 424,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DBC",
@@ -159,6 +214,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // 534,996 accounts
         data_len: 1048,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DBC",
@@ -167,6 +223,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // 81,948 accounts
         data_len: 230,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DBC",
@@ -175,6 +232,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // 42,953 accounts
         data_len: 280,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DBC",
@@ -183,6 +241,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // 2,376 accounts
         data_len: 168,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DBC",
@@ -203,6 +262,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // observed evidence.
         data_len: 148,
         len_rule: LenRule::AtLeast,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DBC",
@@ -218,6 +278,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // anything below 148 cannot hold the fixed fields.
         data_len: 148,
         len_rule: LenRule::AtLeast,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DBC",
@@ -227,6 +288,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // Meteora layout / carbon decoder. Disc is sha256("account:Operator")[..8].
         data_len: 72,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DBC",
@@ -238,6 +300,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // VirtualPool — the collision that makes length-only checks unsafe.
         data_len: 424,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DBC",
@@ -248,6 +311,7 @@ pub const METEORA_DBC_ACCOUNTS: &[AccountSpec] = &[
         // sha256("account:ConfigWithTransferHook")[..8].
         data_len: 1128,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
 ];
 
@@ -267,6 +331,7 @@ pub const METEORA_DLMM_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 163,843 accounts, all 904 bytes.
         data_len: 904,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DLMM",
@@ -277,6 +342,7 @@ pub const METEORA_DLMM_ACCOUNTS: &[AccountSpec] = &[
         // all 10,136 bytes.
         data_len: 10136,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DLMM",
@@ -289,6 +355,7 @@ pub const METEORA_DLMM_ACCOUNTS: &[AccountSpec] = &[
         // smallest length observed.
         data_len: 8120,
         len_rule: LenRule::AtLeast,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DLMM",
@@ -297,6 +364,7 @@ pub const METEORA_DLMM_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 6,946 accounts, all 1,576 bytes.
         data_len: 1576,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Meteora DLMM",
@@ -305,6 +373,7 @@ pub const METEORA_DLMM_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 392 accounts, all 192 bytes.
         data_len: 192,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
 ];
 
@@ -322,6 +391,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 163,038 accounts, all 653 bytes.
         data_len: 653,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Orca Whirlpool",
@@ -331,6 +401,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // "Position" is a common Anchor name; see the module docs on reuse.
         data_len: 216,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Orca Whirlpool",
@@ -340,6 +411,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // plus 3 in one pool, all 9,988 bytes.
         data_len: 9988,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Orca Whirlpool",
@@ -351,6 +423,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // 148 + k * 112.
         data_len: 148,
         len_rule: LenRule::AtLeast,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Orca Whirlpool",
@@ -359,6 +432,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 673 accounts, all 44 bytes.
         data_len: 44,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Orca Whirlpool",
@@ -367,6 +441,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 508 accounts, all 108 bytes.
         data_len: 108,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Orca Whirlpool",
@@ -375,6 +450,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 197 accounts, all 616 bytes.
         data_len: 616,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Orca Whirlpool",
@@ -383,6 +459,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 17 accounts, all 256 bytes.
         data_len: 256,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Orca Whirlpool",
@@ -391,6 +468,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 1,706 accounts, all 241 bytes.
         data_len: 241,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
     AccountSpec {
         program: "Orca Whirlpool",
@@ -399,6 +477,7 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
         // Swept: 225 accounts, all 136 bytes.
         data_len: 136,
         len_rule: LenRule::Exact,
+        len_eras: &[],
     },
 ];
 
@@ -594,5 +673,46 @@ mod tests {
                 + METEORA_DLMM_ACCOUNTS.len()
                 + ORCA_WHIRLPOOL_ACCOUNTS.len()
         );
+    }
+
+    #[test]
+    fn len_eras_default_to_unbounded_and_resolve_by_slot() {
+        // A row with no eras is one rule for all time.
+        let obligation = find_by_account_type("Obligation").expect("Obligation in registry");
+        assert!(obligation.len_eras.is_empty());
+        assert_eq!(obligation.len_at(0), (3344, LenRule::Exact));
+        assert_eq!(obligation.len_at(u64::MAX), (3344, LenRule::Exact));
+
+        // A split layout: the old era's length before slot 500, the new one
+        // from 500 on, and the current rule in data_len/len_rule.
+        const ERAS: &[LenEra] = &[
+            LenEra {
+                from_slot: 0,
+                data_len: 243,
+                len_rule: LenRule::Exact,
+            },
+            LenEra {
+                from_slot: 500,
+                data_len: 245,
+                len_rule: LenRule::Exact,
+            },
+        ];
+        let split = AccountSpec {
+            program: "Test",
+            account_type: "Split",
+            discriminator: [0; 8],
+            data_len: 245,
+            len_rule: LenRule::Exact,
+            len_eras: ERAS,
+        };
+        assert_eq!(split.len_at(499), (243, LenRule::Exact));
+        assert_eq!(split.len_at(500), (245, LenRule::Exact));
+        assert_eq!(split.len_at(0), (243, LenRule::Exact));
+        // A slot before the first era resolves to the earliest known layout.
+        let late = AccountSpec {
+            len_eras: &ERAS[1..],
+            ..split
+        };
+        assert_eq!(late.len_at(10), (245, LenRule::Exact));
     }
 }
