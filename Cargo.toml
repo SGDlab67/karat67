@@ -41,6 +41,11 @@ solana-pubkey = { version = "4", optional = true }
 # cdylib for wasm-pack; rlib keeps the crate usable as a normal dependency.
 crate-type = ["cdylib", "rlib"]
 
+[dev-dependencies]
+# Property tests for window math and chunking. Dev-only: consumers and the
+# wasm build never see it.
+proptest = "1"
+
 [[bin]]
 name = "karat"
 path = "src/bin/karat.rs"

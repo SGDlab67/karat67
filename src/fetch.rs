@@ -6,6 +6,7 @@
 //! a real endpoint. Completeness uses the same structs via
 //! [`SlotCoverageFetcher`] (`getBlocks`).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 /// One account's on-chain bytes plus the slot they were observed at.
@@ -55,6 +56,58 @@ pub trait SlotCoverageFetcher {
     fn get_blocks(&self, start: u64, end: u64) -> anyhow::Result<Vec<u64>>;
 }
 
+/// Maximum slot range one `getBlocks` call may cover.
+///
+/// The RPC rejects a wider window ("Max range allowed is 500,000 slots",
+/// https://solana.com/docs/rpc/http/getblocks), so a caller with a wider
+/// window must walk it in pieces. `RpcAccountFetcher::get_blocks` does that
+/// inside the fetcher, which is where every caller inherits it.
+pub const MAX_GETBLOCKS_RANGE: u64 = 500_000;
+
+/// Inclusive windows of at most `max` slots covering `[start, end]`.
+///
+/// Ascending and non-overlapping, and they tile the range exactly: each
+/// window starts one slot after the previous one ends, so no produced slot
+/// can fall between two windows. Empty when `end < start` or `max == 0`.
+pub fn slot_windows(start: u64, end: u64, max: u64) -> Vec<(u64, u64)> {
+    let mut windows = Vec::new();
+    if end < start || max == 0 {
+        return windows;
+    }
+    let mut window_start = start;
+    loop {
+        let window_end = window_start.saturating_add(max - 1).min(end);
+        windows.push((window_start, window_end));
+        if window_end == end {
+            return windows;
+        }
+        // window_end < end <= u64::MAX, so the increment cannot overflow.
+        window_start = window_end + 1;
+    }
+}
+
+/// Fetch produced block slots over `[start, end]` one window at a time,
+/// merging the pieces into a single sorted, deduplicated list.
+///
+/// `fetch` is the single-window call: `RpcAccountFetcher` passes its raw
+/// request, tests pass a mock. The walk lives here rather than in an RPC
+/// method so the chunking is offline-testable and so the merge step is the
+/// same code path for every caller.
+pub fn get_blocks_in_windows(
+    mut fetch: impl FnMut(u64, u64) -> anyhow::Result<Vec<u64>>,
+    start: u64,
+    end: u64,
+    max: u64,
+) -> anyhow::Result<Vec<u64>> {
+    let mut slots: Vec<u64> = Vec::new();
+    for (window_start, window_end) in slot_windows(start, end, max) {
+        slots.extend(fetch(window_start, window_end)?);
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    Ok(slots)
+}
+
 /// In-memory [`AccountFetcher`] / [`SlotCoverageFetcher`] with canned data for
 /// hermetic tests.
 ///
@@ -67,6 +120,9 @@ pub struct MockFetcher {
     /// Confirmed block slots returned by [`SlotCoverageFetcher::get_blocks`].
     /// Slots outside the requested window are filtered out.
     blocks: Vec<u64>,
+    /// `get_blocks` invocations, so a test can prove a short-circuit made no
+    /// call at all rather than guessing from the result.
+    block_fetches: Cell<usize>,
     unreachable: bool,
 }
 
@@ -77,6 +133,7 @@ impl MockFetcher {
             context_slot,
             accounts: HashMap::new(),
             blocks: Vec::new(),
+            block_fetches: Cell::new(0),
             unreachable: false,
         }
     }
@@ -87,8 +144,14 @@ impl MockFetcher {
             context_slot: 0,
             accounts: HashMap::new(),
             blocks: Vec::new(),
+            block_fetches: Cell::new(0),
             unreachable: true,
         }
+    }
+
+    /// How many times [`SlotCoverageFetcher::get_blocks`] was called.
+    pub fn block_fetches(&self) -> usize {
+        self.block_fetches.get()
     }
 
     /// Register `key` as present on chain with `data`, observed at `slot`.
@@ -125,6 +188,7 @@ impl AccountFetcher for MockFetcher {
 
 impl SlotCoverageFetcher for MockFetcher {
     fn get_blocks(&self, start: u64, end: u64) -> anyhow::Result<Vec<u64>> {
+        self.block_fetches.set(self.block_fetches.get() + 1);
         if self.unreachable {
             anyhow::bail!("mock fetcher is unreachable");
         }
@@ -217,42 +281,58 @@ impl SlotCoverageFetcher for RpcAccountFetcher {
         if end < start {
             anyhow::bail!("getBlocks end slot {end} is before start slot {start}");
         }
-
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getBlocks",
-            "params": [start, end],
-        });
-
-        let mut response = self
-            .agent
-            .post(&self.endpoint)
-            .send_json(&request)
-            .map_err(|e| anyhow::anyhow!("getBlocks request failed: {e}"))?;
-        let body: serde_json::Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|e| anyhow::anyhow!("reading getBlocks response failed: {e}"))?;
-
-        if let Some(error) = body.get("error") {
-            anyhow::bail!("RPC returned an error: {error}");
-        }
-
-        let values = body
-            .get("result")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("RPC response missing `result` array"))?;
-
-        values
-            .iter()
-            .map(|value| {
-                value
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("getBlocks entry is not a u64: {value}"))
-            })
-            .collect()
+        // Wide windows are chunked here, so no caller has to know the RPC's
+        // 500,000-slot cap. The 158.91 h outage in karat67's incident log is
+        // about 1.4M slots: three windows at this size.
+        get_blocks_in_windows(
+            |window_start, window_end| get_blocks_once(self, window_start, window_end),
+            start,
+            end,
+            MAX_GETBLOCKS_RANGE,
+        )
     }
+}
+
+/// One raw `getBlocks` call, with no windowing.
+///
+/// [`RpcAccountFetcher::get_blocks`] is the entry point; it walks the
+/// 500,000-slot chunking around this single-window request.
+#[cfg(feature = "rpc")]
+fn get_blocks_once(fetcher: &RpcAccountFetcher, start: u64, end: u64) -> anyhow::Result<Vec<u64>> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBlocks",
+        "params": [start, end],
+    });
+
+    let mut response = fetcher
+        .agent
+        .post(&fetcher.endpoint)
+        .send_json(&request)
+        .map_err(|e| anyhow::anyhow!("getBlocks request failed: {e}"))?;
+    let body: serde_json::Value = response
+        .body_mut()
+        .read_json()
+        .map_err(|e| anyhow::anyhow!("reading getBlocks response failed: {e}"))?;
+
+    if let Some(error) = body.get("error") {
+        anyhow::bail!("RPC returned an error: {error}");
+    }
+
+    let values = body
+        .get("result")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("RPC response missing `result` array"))?;
+
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("getBlocks entry is not a u64: {value}"))
+        })
+        .collect()
 }
 
 /// Decode one `getMultipleAccounts` value entry into a [`FetchedAccount`].
@@ -290,6 +370,7 @@ fn decode_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn mock_returns_registered_account() {
@@ -349,5 +430,77 @@ mod tests {
     fn mock_get_blocks_unreachable_errors() {
         let fetcher = MockFetcher::unreachable();
         assert!(fetcher.get_blocks(1, 10).is_err());
+    }
+
+    #[test]
+    fn slot_windows_keep_a_range_that_fits_in_one_call() {
+        assert_eq!(
+            slot_windows(100, 104, MAX_GETBLOCKS_RANGE),
+            vec![(100, 104)]
+        );
+    }
+
+    #[test]
+    fn slot_windows_split_an_outage_sized_range_into_three() {
+        // 1.4M slots, the size of the 158.91 h incident: three windows at
+        // the RPC's 500,000-slot cap, tiling exactly.
+        let windows = slot_windows(0, 1_400_000, MAX_GETBLOCKS_RANGE);
+        assert_eq!(
+            windows,
+            vec![(0, 499_999), (500_000, 999_999), (1_000_000, 1_400_000)]
+        );
+    }
+
+    #[test]
+    fn slot_windows_of_an_inverted_range_are_empty() {
+        assert!(slot_windows(10, 9, MAX_GETBLOCKS_RANGE).is_empty());
+    }
+
+    #[test]
+    fn chunked_get_blocks_merges_sorted_and_deduplicated() {
+        let mock = MockFetcher::new(0).with_blocks([5, 1, 3, 3, 7]);
+        let slots =
+            get_blocks_in_windows(|s, e| mock.get_blocks(s, e), 0, 9, 100).expect("reachable");
+        assert_eq!(slots, vec![1, 3, 5, 7]);
+    }
+
+    proptest! {
+        /// Chunking a wide window must return exactly what one call would.
+        #[test]
+        fn chunked_equals_unchunked(
+            raw in prop::collection::vec(0u64..3_000_000, 0..200),
+            start in 0u64..1_000_000,
+            span in 0u64..2_000_000,
+            max in 1u64..1000,
+        ) {
+            let end = start + span;
+            let mock = MockFetcher::new(0).with_blocks(raw);
+            let unchunked = mock.get_blocks(start, end).expect("reachable");
+            let chunked = get_blocks_in_windows(|s, e| mock.get_blocks(s, e), start, end, max)
+                .expect("reachable");
+            prop_assert_eq!(chunked, unchunked);
+        }
+
+        /// Windows cover the range exactly: ascending, contiguous, each at
+        /// most `max` slots, starting at `start` and ending at `end`.
+        #[test]
+        fn windows_tile_the_range(
+            start in 0u64..1_000_000,
+            span in 0u64..2_000_000,
+            max in 1u64..1000,
+        ) {
+            let end = start + span;
+            let windows = slot_windows(start, end, max);
+            prop_assert!(!windows.is_empty());
+            prop_assert_eq!(windows[0].0, start);
+            prop_assert_eq!(windows.last().expect("non-empty").1, end);
+            for (i, (window_start, window_end)) in windows.iter().enumerate() {
+                prop_assert!(window_start <= window_end);
+                prop_assert!(window_end - window_start < max);
+                if i > 0 {
+                    prop_assert_eq!(*window_start, windows[i - 1].1 + 1);
+                }
+            }
+        }
     }
 }
