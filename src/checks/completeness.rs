@@ -146,11 +146,48 @@ pub fn check_orphans(
     CheckResult::fail(name, detail.to_string())
 }
 
+/// Produced blocks in the open interval `(last_before, first_after)`: the
+/// exact backfill list after a stream reconnect.
+///
+/// A streaming datasource that drops its connection knows two slots: the last
+/// one it processed before the drop and the first one it saw after the
+/// reconnect. Whatever the chain produced strictly between them is what the
+/// indexer missed, in the form it can be replayed.
+///
+/// The interval is open at both ends because both boundary slots were
+/// observed by the stream: `last_before` was processed before the drop, and
+/// `first_after` is being processed now. Listing either end as a gap would
+/// ask for a backfill of something already in the index.
+///
+/// - An empty interval (adjacent slots, for example) returns an empty list
+///   and makes no RPC call.
+/// - An unreachable fetch is an `Err`, never an empty list: "nothing was
+///   missed" and "could not check" must not read the same.
+/// - Leader skip-slots are not gaps. They never produced a block, so
+///   `getBlocks` omits them and they cannot appear here.
+pub fn gap_slots(
+    last_before: u64,
+    first_after: u64,
+    fetcher: &dyn SlotCoverageFetcher,
+) -> anyhow::Result<Vec<u64>> {
+    let start = last_before.saturating_add(1);
+    let end = first_after.saturating_sub(1);
+    if end < start {
+        return Ok(Vec::new());
+    }
+    let mut produced = fetcher.get_blocks(start, end)?;
+    produced.sort_unstable();
+    produced.dedup();
+    Ok(produced)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fetch::MockFetcher;
     use crate::report::Status;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn full_coverage_passes() {
@@ -311,5 +348,69 @@ mod tests {
         assert_eq!(sample.len(), MISSING_SAMPLE_LIMIT);
         assert_eq!(sample[0], 0);
         assert_eq!(sample[15], 15);
+    }
+
+    #[test]
+    fn adjacent_slots_are_an_empty_window_and_make_no_fetch() {
+        let fetcher = MockFetcher::new(0).with_blocks([100, 101, 102]);
+        let gaps = gap_slots(100, 101, &fetcher).expect("reachable");
+        assert!(gaps.is_empty());
+        // The short circuit happens before the fetcher: no call, not a call
+        // that happened to match nothing.
+        assert_eq!(fetcher.block_fetches(), 0);
+    }
+
+    #[test]
+    fn skip_slots_are_not_gaps() {
+        // The reconnect window (99, 106) covers heights 100..=105, but the
+        // leader skipped 102, so getBlocks never produced it. Only produced
+        // blocks belong in the backfill list.
+        let fetcher = MockFetcher::new(0).with_blocks([100, 101, 103, 104, 105]);
+        let gaps = gap_slots(99, 106, &fetcher).expect("reachable");
+        assert_eq!(gaps, vec![100, 101, 103, 104, 105]);
+        assert_eq!(fetcher.block_fetches(), 1);
+    }
+
+    #[test]
+    fn a_window_wider_than_one_getblocks_call_keeps_every_produced_block() {
+        // Two chunks' worth of window (the fetcher chunks at 500,000 slots);
+        // the backfill list must be complete, sorted and unique regardless.
+        let boundary = crate::fetch::MAX_GETBLOCKS_RANGE;
+        let fetcher = MockFetcher::new(0).with_blocks([boundary - 1, boundary, boundary + 1]);
+        let gaps = gap_slots(boundary - 2, boundary + 3, &fetcher).expect("reachable");
+        assert_eq!(gaps, vec![boundary - 1, boundary, boundary + 1]);
+    }
+
+    #[test]
+    fn unreachable_fetch_is_an_error_not_an_empty_list() {
+        let fetcher = MockFetcher::unreachable();
+        let result = gap_slots(100, 200, &fetcher);
+        assert!(
+            result.is_err(),
+            "an unreachable fetch must not read as no gaps"
+        );
+    }
+
+    proptest! {
+        /// The list is exactly the produced blocks inside the open interval,
+        /// in slot order, with duplicates collapsed.
+        #[test]
+        fn gaps_are_the_produced_blocks_in_the_open_interval(
+            last_before in 0u64..1_000_000,
+            span in 0u64..64,
+            produced in prop::collection::vec(0u64..1_100_000, 0..300),
+        ) {
+            let first_after = last_before + span;
+            let fetcher = MockFetcher::new(0).with_blocks(produced.iter().copied());
+            let got = gap_slots(last_before, first_after, &fetcher).expect("reachable");
+            let expected: Vec<u64> = produced
+                .iter()
+                .copied()
+                .collect::<BTreeSet<u64>>()
+                .into_iter()
+                .filter(|slot| *slot > last_before && *slot < first_after)
+                .collect();
+            prop_assert_eq!(got, expected);
+        }
     }
 }
