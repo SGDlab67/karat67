@@ -87,9 +87,20 @@ karat completeness \
 # Orphans: same flags as completeness (RPC from --rpc-url or KARAT_RPC_URL),
 # asking the reverse question.
 karat orphans --start 250000000 --end 250000100 --slots 250000000,250000002
+
+# Gaps: the exact backfill list after a stream reconnect. Takes the two slots
+# a disconnecting datasource knows (Carbon's DatasourceDisconnection: last
+# slot before the drop, first slot after the reconnect) and lists every block
+# the chain produced strictly between them. Skip-slots are absent by
+# construction, and the summary prints Carbon's own estimate next to the real
+# count. --out writes the full list, one slot per line.
+karat gaps \
+  --rpc-url https://api.mainnet-beta.solana.com \
+  --last-before 250000000 --first-after 250000300 \
+  --out gaps.txt
 ```
 
-On a terminal, `shape`, `account`, `completeness` and `orphans` print a
+On a terminal, `shape`, `account`, `completeness`, `orphans` and `gaps` print a
 readable report; piped (or with `--json`) they print JSON, one object per
 check. `reconcile` always prints JSON. `account` runs shape on the decoded
 bytes and, only when that is Pass, the reconcile check for that account, so a
@@ -101,6 +112,12 @@ mismatch, `reconcile` reports the offending account, the indexed vs on-chain
 lengths, and the first differing byte offset; lag-tolerated rows add
 `"reason":"slot lag"`. On a completeness gap, Fail detail lists
 `missing_count` and a `missing_sample` of produced-but-unindexed slots.
+
+`gaps` is the one exception to the exit rule, and deliberately so: its
+deliverable is a list, so it exits 0 whenever the list was computed, empty or
+not. Only a fetch that could not be made exits 1. The full list lands in
+`--json` (unless `--out` already wrote it) or in the file `--out` names; the
+terminal report lists the first 16 slots and points at `--out` for the rest.
 
 The RPC client uses a lightweight, rustls-based HTTP client (`ureq`) instead
 of the full `solana-client` stack, so builds stay toolchain-only with no
@@ -179,14 +196,16 @@ shape check, and `gate_account` is the same gate as `karat account`
 ## MCP
 
 `karat-mcp` is a stdio JSON-RPC server (`initialize`, `tools/list`,
-`tools/call`) with one tool, `check_account`. Arguments match `karat account`:
+`tools/call`) with two tools. `check_account` matches `karat account`:
 `account`, `indexed_base64`, optional `indexed_slot`, `max_slot_lag` (default
 32), and `rpc_url` (or `KARAT_RPC_URL`). Shape runs first; reconcile runs only
-after Pass, so a bad payload never calls RPC.
+after Pass, so a bad payload never calls RPC. `find_gaps` matches `karat gaps`:
+`last_before`, `first_after`, and `rpc_url` (or `KARAT_RPC_URL`), returning the
+backfill list for the window.
 
-The tool text is JSON `{ "ok": bool, "results": [...] }`. `ok` is true only
-when every result is Pass — the same rule as the CLI exit code. `isError` is
-the inverse of `ok`.
+The tool text is JSON `{ "ok": bool, ... }`. `ok` is true only when the call
+completed and every result is Pass, the same rule as the CLI exit code.
+`isError` is the inverse of `ok`.
 
 Send one JSON object per line, or a `Content-Length` frame. Replies are
 `Content-Length` frames.
@@ -197,6 +216,18 @@ cargo run --quiet --bin karat-mcp
 
 ## Roadmap
 
+- `karat gaps` (done): the exact backfill list for the window a disconnecting
+  stream reports. Carbon 2's `DatasourceDisconnection` carries the two
+  boundary slots, but its `missed_slots` field is a height count that includes
+  leader skip-slots and both observed ends, and lists nothing. `gaps` runs
+  `getBlocks` over the open interval and emits the produced blocks, sorted and
+  deduped, which is what a replayer can consume (Carbon adapter:
+  `karat67::carbon::gaps_for_disconnection`). Measured live on mainnet: a
+  19,999-slot window produced 19,987 blocks with 12 leader skips, where
+  Carbon's formula reports 20,000; a 600,001-slot window (599,549 blocks) is
+  two `getBlocks` calls, because the fetcher chunks at the RPC's 500,000-slot
+  cap, so the 158.91 h outage (about 1.4M slots) would be three. The
+  off-by-one is drafted upstream in `updates/carbon-missed-slots-draft.md`.
 - IDL-driven account specs (done for Kamino Lend, Meteora DBC, Meteora DLMM
   and Orca Whirlpool, 29 types): new account types are `AccountSpec` data and
   the `Check` trait is the uniform seam. Each program after the first cost one
