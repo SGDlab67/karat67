@@ -11,4 +11,9 @@ anyhow = "1"
 karat67 = { path = "../..", features = ["carbon"] }
 carbon-core = { version = "2", default-features = false }
 carbon-kamino-lending-decoder = "2"
+# The datasource whose disconnect event `karat gaps` turns into a backfill
+# list. Its own package so the gRPC stack never enters karat67's deps.
+carbon-yellowstone-grpc-datasource = "2"
 solana-account = "4"
+# Only for the disconnect_notifier channel; no runtime is started.
+tokio = { version = "1", features = ["sync"] }

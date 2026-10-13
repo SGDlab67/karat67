@@ -42,6 +42,71 @@ impl KaratIntegrityProcessor {
 #[cfg(feature = "carbon")]
 pub use pipeline::KaratDecoder;
 
+/// The backfill list for a Carbon disconnection event.
+///
+/// One call on the receiving end of a datasource's `disconnect_notifier`
+/// channel: hand it the event and a [`SlotCoverageFetcher`]
+/// ([`RpcAccountFetcher`](crate::fetch::RpcAccountFetcher) in production,
+/// [`MockFetcher`](crate::fetch::MockFetcher) in tests) and get the produced
+/// blocks in the open interval it names.
+///
+/// Carbon's own `missed_slots` field is an estimate: it counts leader
+/// skip-slots, includes both observed ends, and is sent with `try_send`, so
+/// the event itself can be dropped. This is the list those slots can
+/// actually be backfilled from.
+///
+/// [`SlotCoverageFetcher`]: crate::fetch::SlotCoverageFetcher
+#[cfg(feature = "carbon")]
+pub fn gaps_for_disconnection(
+    disconnection: &carbon_core::datasource::DatasourceDisconnection,
+    fetcher: &dyn crate::fetch::SlotCoverageFetcher,
+) -> anyhow::Result<Vec<u64>> {
+    crate::checks::completeness::gap_slots(
+        disconnection.last_slot_before_disconnect,
+        disconnection.first_slot_after_reconnect,
+        fetcher,
+    )
+}
+
+#[cfg(all(test, feature = "carbon"))]
+mod disconnection_tests {
+    use super::*;
+    use crate::fetch::MockFetcher;
+    use carbon_core::datasource::DatasourceDisconnection;
+
+    #[test]
+    fn carbon_disconnection_becomes_a_backfill_list() {
+        let event = DatasourceDisconnection {
+            source: "yellowstone-grpc".to_string(),
+            disconnect_time: Default::default(),
+            last_slot_before_disconnect: 99,
+            first_slot_after_reconnect: 106,
+            // Carbon's estimate for this window: 106 - 99.
+            missed_slots: 7,
+        };
+        // The chain produced 100, 101, 103, 104; 102 was a leader skip.
+        let fetcher = MockFetcher::new(0).with_blocks([100, 101, 103, 104]);
+        let gaps = gaps_for_disconnection(&event, &fetcher).expect("reachable");
+        assert_eq!(gaps, vec![100, 101, 103, 104]);
+        assert_eq!(event.missed_slots, 7);
+
+        // Adjacent slots: Carbon still reports 1 missed slot, the interval
+        // is empty, and no fetch happens at all.
+        let adjacent = DatasourceDisconnection {
+            last_slot_before_disconnect: 100,
+            first_slot_after_reconnect: 101,
+            missed_slots: 1,
+            ..event
+        };
+        let fetcher = MockFetcher::new(0);
+        assert_eq!(
+            gaps_for_disconnection(&adjacent, &fetcher).expect("reachable"),
+            Vec::<u64>::new()
+        );
+        assert_eq!(fetcher.block_fetches(), 0);
+    }
+}
+
 #[cfg(feature = "carbon")]
 mod pipeline {
     use crate::checks::shape::check_shape;
