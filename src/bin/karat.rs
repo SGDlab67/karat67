@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
-use karat67::checks::completeness::{check_completeness, check_orphans};
+use karat67::checks::completeness::{check_completeness, check_orphans, gap_slots};
 use karat67::checks::reconcile::{DEFAULT_MAX_SLOT_LAG, SampleRow, reconcile};
 use karat67::checks::shape::{AccountSpec, check_shape};
 use karat67::checks::specs::{LenRule, account_type_names, find_by_account_type};
@@ -106,6 +106,31 @@ enum Command {
         /// repeatable `--slot` values.
         #[arg(long = "slots")]
         slots: Option<String>,
+    },
+    /// Gaps: the exact backfill list after a stream reconnect. Takes the two
+    /// slots a disconnecting datasource knows (Carbon's
+    /// `DatasourceDisconnection`: last slot before the drop, first slot after
+    /// the reconnect) and lists every produced block strictly between them.
+    ///
+    /// Exit code: 0 whenever the list was computed, non-empty or not. The
+    /// list is the deliverable here, not a verdict. A fetch that cannot be
+    /// made exits 1, because a fetch that did not happen is never green.
+    Gaps {
+        /// Solana JSON-RPC endpoint. Falls back to `KARAT_RPC_URL`.
+        #[arg(long, env = "KARAT_RPC_URL")]
+        rpc_url: String,
+        /// Last slot the stream processed before it dropped.
+        #[arg(long)]
+        last_before: u64,
+        /// First slot the stream processed after it reconnected. Must be
+        /// greater than `--last-before`.
+        #[arg(long)]
+        first_after: u64,
+        /// Write the full list to this file, one slot per line, instead of
+        /// printing it. The summary still prints, and the JSON drops its
+        /// `gaps` array in favor of `out`.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
     /// Shape-check one account's real indexed bytes, then reconcile that
     /// account against RPC only if shape passes. Prints JSON results. Exits
@@ -256,6 +281,51 @@ fn main() -> anyhow::Result<()> {
             // Same policy as completeness: exit 0 only on Pass.
             if result.status != Status::Pass {
                 std::process::exit(1);
+            }
+        }
+        Command::Gaps {
+            rpc_url,
+            last_before,
+            first_after,
+            out,
+        } => {
+            if first_after <= last_before {
+                anyhow::bail!(
+                    "--first-after {first_after} must be greater than --last-before {last_before}"
+                );
+            }
+
+            let fetcher = RpcAccountFetcher::new(rpc_url);
+            let gaps = match gap_slots(last_before, first_after, &fetcher) {
+                Ok(gaps) => gaps,
+                Err(error) => {
+                    // Skipped is never green: a fetch that could not run
+                    // exits non-zero here too, in both output modes.
+                    let name = format!("gaps(({last_before}, {first_after}))");
+                    let result = CheckResult::skipped(name, format!("fetch unreachable: {error}"));
+                    if cli.json || !std::io::stdout().is_terminal() {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else {
+                        eprintln!("gaps: {error}");
+                        eprintln!("exit code 1: a fetch that did not happen is never green");
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            let report = gap_report(last_before, first_after, gaps);
+            if let Some(path) = out.as_deref() {
+                let body: String = report.gaps.iter().map(|slot| format!("{slot}\n")).collect();
+                std::fs::write(path, body)
+                    .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+            }
+            if cli.json || !std::io::stdout().is_terminal() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&gaps_json(&report, out.as_deref()))?
+                );
+            } else {
+                print!("{}", render_gaps(&report, out.as_deref()));
             }
         }
         Command::Account {
@@ -635,6 +705,148 @@ fn group(n: impl std::fmt::Display) -> String {
     out
 }
 
+/// How many gap slots the terminal report lists before pointing at `--out`.
+const GAP_SAMPLE_LIMIT: usize = 16;
+
+/// Everything `karat gaps` reports, computed from the two boundary slots and
+/// the produced list so both output modes and the tests read one source.
+struct GapReport {
+    last_before: u64,
+    first_after: u64,
+    /// Produced blocks in the open interval: the backfill list.
+    gaps: Vec<u64>,
+    /// Heights in the open interval with no block: leader skip-slots.
+    skipped: u64,
+}
+
+impl GapReport {
+    /// Carbon's own estimate, for the side-by-side: `first - last` counts
+    /// every height between the two observed slots with both ends included,
+    /// and cannot tell a produced block from a skip-slot.
+    fn carbon_missed_slots(&self) -> u64 {
+        self.first_after.saturating_sub(self.last_before)
+    }
+}
+
+/// Build the report from the boundary slots and the produced list.
+///
+/// Callers pass `first_after > last_before` (the CLI rejects anything else);
+/// an adjacent pair is the empty interval and every count here is 0.
+fn gap_report(last_before: u64, first_after: u64, gaps: Vec<u64>) -> GapReport {
+    let window = first_after - last_before - 1;
+    let skipped = window.saturating_sub(gaps.len() as u64);
+    GapReport {
+        last_before,
+        first_after,
+        gaps,
+        skipped,
+    }
+}
+
+/// Machine output. Carries the full `gaps` array, or the `out` path when
+/// `--out` already wrote it to a file.
+fn gaps_json(report: &GapReport, out: Option<&std::path::Path>) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "last_before": report.last_before,
+        "first_after": report.first_after,
+        "window_start": report.last_before + 1,
+        "window_end": report.first_after - 1,
+        "window_slots": report.first_after - report.last_before - 1,
+        "produced_blocks": report.gaps.len(),
+        "skipped_slots": report.skipped,
+        "carbon_missed_slots": report.carbon_missed_slots(),
+        "gap_count": report.gaps.len(),
+    });
+    match out {
+        Some(path) => json["out"] = serde_json::json!(path.display().to_string()),
+        None => json["gaps"] = serde_json::json!(report.gaps),
+    }
+    json
+}
+
+/// Terminal report: the window, the numbers, and Carbon's formula next to
+/// them so the difference is visible rather than argued.
+fn render_gaps(report: &GapReport, out: Option<&std::path::Path>) -> String {
+    use std::fmt::Write as _;
+
+    let color = std::env::var_os("NO_COLOR").is_none();
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
+    let mut text = String::new();
+
+    let _ = writeln!(text);
+    let _ = writeln!(
+        text,
+        "  {}  gaps · after slot {}, before slot {}",
+        paint("1;33", "karat67"),
+        group(report.last_before),
+        group(report.first_after)
+    );
+    let _ = writeln!(text);
+    let _ = writeln!(
+        text,
+        "  window      {:>6} slots    [{}..={}]",
+        group(report.first_after - report.last_before - 1),
+        group(report.last_before + 1),
+        group(report.first_after - 1)
+    );
+    let _ = writeln!(
+        text,
+        "  backfill    {:>6} blocks   every block the chain produced inside it",
+        group(report.gaps.len())
+    );
+    let _ = writeln!(
+        text,
+        "  skip-slots  {:>6}          leader skips: no block was ever produced",
+        group(report.skipped)
+    );
+    let _ = writeln!(
+        text,
+        "  carbon      {:>6} slots    first minus last: counts both ends and skip-slots, names nothing",
+        group(report.carbon_missed_slots())
+    );
+    let _ = writeln!(text);
+
+    if report.gaps.is_empty() {
+        let _ = writeln!(
+            text,
+            "  nothing to backfill: the chain produced no block in the window"
+        );
+    } else {
+        let sample: Vec<String> = report
+            .gaps
+            .iter()
+            .take(GAP_SAMPLE_LIMIT)
+            .map(|slot| group(*slot))
+            .collect();
+        let label = if report.gaps.len() > GAP_SAMPLE_LIMIT {
+            "first blocks:"
+        } else {
+            "backfill:"
+        };
+        for line in wrap(&format!("{label} {}", sample.join(" ")), 60) {
+            let _ = writeln!(text, "  {line}");
+        }
+        if report.gaps.len() > GAP_SAMPLE_LIMIT {
+            let _ = writeln!(
+                text,
+                "  {} more; --out writes the full list",
+                group(report.gaps.len() - GAP_SAMPLE_LIMIT)
+            );
+        }
+    }
+    if let Some(path) = out {
+        let _ = writeln!(text, "  full list: {}", path.display());
+    }
+    let _ = writeln!(text);
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +883,44 @@ mod tests {
         );
         assert_eq!(lines[1], "missing: 101 104");
         assert_eq!(describe_missing("not json"), vec!["not json"]);
+    }
+
+    #[test]
+    fn gaps_report_counts_blocks_skips_and_carbons_estimate() {
+        // Window (99, 106) covers heights 100..=105; the chain produced four
+        // of them (102 was a leader skip), so two heights are skip-slots.
+        let report = gap_report(99, 106, vec![100, 101, 103, 104]);
+        assert_eq!(report.skipped, 2);
+        // Carbon: 106 - 99 = 7. It over-counts the four real blocks by three:
+        // one off-by-one against its own doc comment, plus the two skips.
+        assert_eq!(report.carbon_missed_slots(), 7);
+
+        let text = render_gaps(&report, None);
+        assert!(text.contains("[100..=105]"));
+        assert!(text.contains("100 101 103 104"));
+        assert!(text.contains("4 blocks"));
+        assert!(text.contains("7 slots"));
+
+        let json = gaps_json(&report, None);
+        assert_eq!(json["window_slots"], 6);
+        assert_eq!(json["gap_count"], 4);
+        assert_eq!(json["skipped_slots"], 2);
+        assert_eq!(json["carbon_missed_slots"], 7);
+        assert_eq!(json["gaps"], serde_json::json!([100, 101, 103, 104]));
+
+        // Adjacent slots: the empty interval. Carbon's formula still claims
+        // one missed slot, which is the off-by-one in its doc comment.
+        let adjacent = gap_report(100, 101, vec![]);
+        assert_eq!(adjacent.skipped, 0);
+        assert_eq!(adjacent.carbon_missed_slots(), 1);
+        let json = gaps_json(&adjacent, None);
+        assert_eq!(json["window_slots"], 0);
+        assert_eq!(json["gap_count"], 0);
+        assert!(render_gaps(&adjacent, None).contains("nothing to backfill"));
+
+        // With --out, the list is a file and the JSON says which one.
+        let json = gaps_json(&report, Some(std::path::Path::new("/tmp/gaps.txt")));
+        assert!(json.get("gaps").is_none());
+        assert_eq!(json["out"], "/tmp/gaps.txt");
     }
 }
