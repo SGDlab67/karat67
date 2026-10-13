@@ -1,9 +1,10 @@
-//! Minimal stdio JSON-RPC server so an agent can call the account gate.
+//! Stdio JSON-RPC server so an agent can call the integrity checks.
 //!
-//! Speaks `initialize`, `tools/list`, and `tools/call`. The only tool is
-//! `check_account`, with the same inputs as `karat account`. The tool text is
-//! JSON `{ "ok": bool, "results": [...] }`. `ok` is true only when every
-//! result is Pass.
+//! Speaks `initialize`, `tools/list`, and `tools/call`. Two tools:
+//! `check_account`, with the same inputs as `karat account`, and `find_gaps`,
+//! with the same inputs as `karat gaps`. Each tool's text is JSON
+//! (`{ "ok": bool, ... }`); `ok` is true only when the call completed and
+//! every result is Pass.
 //!
 //! Input is one JSON object per line, or a `Content-Length` frame. Replies are
 //! `Content-Length` frames. No MCP SDK.
@@ -79,15 +80,24 @@ fn tools_list() -> Value {
                 },
                 "required": ["account", "indexed_base64"]
             }
+        }, {
+            "name": "find_gaps",
+            "description": "List the blocks the chain produced strictly between the two slots a disconnecting stream reports (last slot before the drop, first slot after the reconnect). The exact backfill list; gap_count 0 means nothing was missed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "last_before": { "type": "integer", "description": "Last slot the stream processed before it dropped" },
+                    "first_after": { "type": "integer", "description": "First slot the stream processed after it reconnected" },
+                    "rpc_url": { "type": "string", "description": "Solana JSON-RPC URL. Falls back to KARAT_RPC_URL" }
+                },
+                "required": ["last_before", "first_after"]
+            }
         }]
     })
 }
 
 fn tools_call(params: &Value) -> Result<Value, Value> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    if name != "check_account" {
-        return Err(error_object(-32602, format!("unknown tool {name}")));
-    }
     let arguments = params
         .get("arguments")
         .cloned()
@@ -95,7 +105,12 @@ fn tools_call(params: &Value) -> Result<Value, Value> {
     if !arguments.is_object() {
         return Err(error_object(-32602, "arguments must be an object"));
     }
-    let payload = run_check_account(&arguments).map_err(|message| error_object(-32602, message))?;
+    let payload = match name {
+        "check_account" => run_check_account(&arguments),
+        "find_gaps" => run_find_gaps(&arguments),
+        _ => return Err(error_object(-32602, format!("unknown tool {name}"))),
+    }
+    .map_err(|message| error_object(-32602, message))?;
     let ok = payload.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let text = serde_json::to_string(&payload)
         .map_err(|e| error_object(-32603, format!("encoding result failed: {e}")))?;
@@ -124,6 +139,26 @@ fn run_check_account(args: &Value) -> Result<Value, String> {
     Ok(json!({
         "ok": gate::all_pass(&results),
         "results": results,
+    }))
+}
+
+fn run_find_gaps(args: &Value) -> Result<Value, String> {
+    let last_before = optional_u64(args, "last_before")?.ok_or("missing last_before")?;
+    let first_after = optional_u64(args, "first_after")?.ok_or("missing first_after")?;
+    if first_after <= last_before {
+        return Err("first_after must be greater than last_before".to_string());
+    }
+    let url = rpc_url_from(args).ok_or("missing rpc_url (or KARAT_RPC_URL)")?;
+    let fetcher = RpcAccountFetcher::new(url);
+    let gaps = crate::checks::completeness::gap_slots(last_before, first_after, &fetcher)
+        .map_err(|e| format!("fetch failed: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "last_before": last_before,
+        "first_after": first_after,
+        "gap_count": gaps.len(),
+        "carbon_missed_slots": first_after.saturating_sub(last_before),
+        "gaps": gaps,
     }))
 }
 
@@ -260,12 +295,31 @@ mod tests {
         }))
         .expect("response");
         assert_eq!(list["result"]["tools"][0]["name"], "check_account");
+        assert_eq!(list["result"]["tools"][1]["name"], "find_gaps");
         assert!(
             handle_request(&json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/initialized"
             }))
             .is_none()
+        );
+    }
+
+    #[test]
+    fn find_gaps_rejects_a_missing_slot_without_touching_rpc() {
+        let response = handle_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "find_gaps", "arguments": { "last_before": 100 } }
+        }))
+        .expect("response");
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("first_after")
         );
     }
 
