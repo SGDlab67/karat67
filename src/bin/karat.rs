@@ -5,10 +5,13 @@ use clap::{Parser, Subcommand};
 use karat67::checks::completeness::{check_completeness, check_orphans, gap_slots};
 use karat67::checks::reconcile::{DEFAULT_MAX_SLOT_LAG, SampleRow, reconcile};
 use karat67::checks::shape::{AccountSpec, check_shape};
-use karat67::checks::specs::{LenRule, account_type_names, find_by_account_type};
+use karat67::checks::specs::{
+    LenRule, account_type_names, find_by_account_type, find_by_discriminator,
+};
 use karat67::fetch::{AccountFetcher, RpcAccountFetcher};
 use karat67::gate::{all_pass, check_account};
 use karat67::report::{CheckResult, Status};
+use karat67::upgrade::{ProgramUpgrade, SampleReport, read_program_upgrade, sample_accounts};
 
 /// Integrity checks for Solana indexers: verify indexed data is correct,
 /// not just flowing.
@@ -131,6 +134,42 @@ enum Command {
         /// `gaps` array in favor of `out`.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+    },
+    /// Sentinel: the slot a program's code last changed at, so a stale
+    /// decoder has a boundary instead of a guess. Reads the ProgramData
+    /// header for the deploy slot and the upgrade authority, and prints the
+    /// slot as a Carbon `SlotRangeFilter` boundary to paste into a versioned
+    /// decoder set.
+    ///
+    /// With `--sample N`, also lists the accounts matching one discriminator,
+    /// fetches N of them in full, shape-checks each, and reports the observed
+    /// length distribution.
+    ///
+    /// Exit code: 0 when the read succeeded and nothing below says otherwise.
+    /// 1 when `--since` is given and the program was deployed after that slot
+    /// (it changed under you), when the read fails, or when a sampled account
+    /// fails its shape check.
+    Sentinel {
+        /// Solana JSON-RPC endpoint. Falls back to `KARAT_RPC_URL`.
+        #[arg(long, env = "KARAT_RPC_URL")]
+        rpc_url: String,
+        /// Program ID to inspect.
+        #[arg(long)]
+        program: String,
+        /// Exit non-zero when the program was deployed after this slot.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Sample this many accounts of one type and report their lengths.
+        #[arg(long, value_name = "N")]
+        sample: Option<usize>,
+        /// Registered account type to sample, e.g. `Pool`. Must belong to
+        /// `--program`.
+        #[arg(long, conflicts_with = "discriminator")]
+        account_type: Option<String>,
+        /// Discriminator to sample as 16 hex digits, for a type the registry
+        /// does not know yet.
+        #[arg(long)]
+        discriminator: Option<String>,
     },
     /// Shape-check one account's real indexed bytes, then reconcile that
     /// account against RPC only if shape passes. Prints JSON results. Exits
@@ -326,6 +365,73 @@ fn main() -> anyhow::Result<()> {
                 );
             } else {
                 print!("{}", render_gaps(&report, out.as_deref()));
+            }
+        }
+        Command::Sentinel {
+            rpc_url,
+            program,
+            since,
+            sample,
+            account_type,
+            discriminator,
+        } => {
+            let fetcher = RpcAccountFetcher::new(rpc_url);
+            let upgrade = read_program_upgrade(&fetcher, &program)?;
+            let Some(upgrade) = upgrade else {
+                // Not upgradeable: no ProgramData, so nothing to go stale at.
+                if cli.json || !std::io::stdout().is_terminal() {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "program": program,
+                            "upgradeable": false,
+                        }))?
+                    );
+                } else {
+                    println!();
+                    println!("  karat67  sentinel · {program}");
+                    println!();
+                    println!("  not upgradeable: no ProgramData account, so no upgrade slot");
+                    println!();
+                }
+                return Ok(());
+            };
+
+            let sampled = match sample {
+                None => None,
+                Some(count) => {
+                    let (disc, name) =
+                        sample_target(account_type.as_deref(), discriminator.as_deref())?;
+                    let report = sample_accounts(&fetcher, &program, disc, count)?;
+                    Some(SentinelSample {
+                        discriminator: disc,
+                        account_type: name,
+                        report,
+                    })
+                }
+            };
+
+            if cli.json || !std::io::stdout().is_terminal() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&sentinel_json(
+                        &program,
+                        &upgrade,
+                        sampled.as_ref(),
+                        since
+                    ))?
+                );
+            } else {
+                print!("{}", render_sentinel(&program, &upgrade, sampled.as_ref()));
+            }
+
+            // Fail closed: a deploy after --since means the program changed
+            // under the caller, and a sampled shape failure means the
+            // registry's rule no longer matches the chain.
+            let deployed_after_since = since.is_some_and(|since| upgrade.deploy_slot > since);
+            let sample_failed = sampled.as_ref().is_some_and(|s| s.report.failed() > 0);
+            if deployed_after_since || sample_failed {
+                std::process::exit(1);
             }
         }
         Command::Account {
@@ -847,9 +953,202 @@ fn render_gaps(report: &GapReport, out: Option<&std::path::Path>) -> String {
     text
 }
 
+/// The sample half of a sentinel report.
+struct SentinelSample {
+    /// The sampled discriminator.
+    discriminator: [u8; 8],
+    /// Registry name for that discriminator, when there is one.
+    account_type: Option<String>,
+    report: SampleReport,
+}
+
+/// A discriminator as 16 hex digits.
+fn hex8(bytes: &[u8; 8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Resolve `--account-type` or `--discriminator` into a discriminator, plus
+/// the registry name when the type is registered.
+fn sample_target(
+    account_type: Option<&str>,
+    discriminator: Option<&str>,
+) -> anyhow::Result<([u8; 8], Option<String>)> {
+    match (account_type, discriminator) {
+        (Some(name), _) => {
+            let spec = find_by_account_type(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown account type {name:?}, expected one of {:?}",
+                    account_type_names()
+                )
+            })?;
+            Ok((spec.discriminator, Some(spec.account_type.to_string())))
+        }
+        (None, Some(hex)) => Ok((parse_discriminator_hex(hex)?, None)),
+        (None, None) => anyhow::bail!(
+            "--sample needs --account-type <NAME> (registered) or --discriminator <HEX16>"
+        ),
+    }
+}
+
+/// 16 hex digits into the 8 discriminator bytes. A `0x` prefix is accepted.
+fn parse_discriminator_hex(text: &str) -> anyhow::Result<[u8; 8]> {
+    let text = text.trim();
+    let text = text.strip_prefix("0x").unwrap_or(text);
+    if text.len() != 16 {
+        anyhow::bail!("discriminator {text:?} must be 16 hex digits (8 bytes)");
+    }
+    let mut out = [0u8; 8];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+            .map_err(|e| anyhow::anyhow!("discriminator {text:?} is not hex: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// Terminal report for the sentinel: deploy slot, upgrade authority, the
+/// Carbon boundary to paste, and the sample when one was taken. Pure so it is
+/// testable.
+fn render_sentinel(
+    program: &str,
+    upgrade: &ProgramUpgrade,
+    sample: Option<&SentinelSample>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let color = std::env::var_os("NO_COLOR").is_none();
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
+    let mut text = String::new();
+
+    let _ = writeln!(text);
+    let _ = writeln!(text, "  {}  sentinel · {program}", paint("1;33", "karat67"));
+    let _ = writeln!(text);
+    let _ = writeln!(text, "  deploy slot   {}", group(upgrade.deploy_slot));
+    let _ = writeln!(
+        text,
+        "  authority     {}",
+        upgrade
+            .upgrade_authority
+            .as_deref()
+            .unwrap_or("none (immutable)")
+    );
+    let _ = writeln!(text);
+    let _ = writeln!(
+        text,
+        "  carbon boundary, paste into a versioned decoder set:"
+    );
+    let _ = writeln!(
+        text,
+        "    SlotRangeFilter::from({}, None)   the current layout, from this slot on",
+        upgrade.deploy_slot
+    );
+    let _ = writeln!(
+        text,
+        "    SlotRangeFilter::to({}, None)     the layout before it",
+        upgrade.deploy_slot
+    );
+
+    if let Some(sample) = sample {
+        let _ = writeln!(text);
+        let _ = writeln!(
+            text,
+            "  sample        discriminator {} ({})",
+            hex8(&sample.discriminator),
+            sample.account_type.as_deref().unwrap_or("unregistered")
+        );
+        let _ = writeln!(
+            text,
+            "  matched       {} accounts",
+            group(sample.report.matched)
+        );
+        let _ = writeln!(text, "  fetched       {}", group(sample.report.fetched));
+        let _ = writeln!(text, "  lengths");
+        for (length, stat) in &sample.report.lengths {
+            let _ = writeln!(
+                text,
+                "    {:>10}  {:>7} fetched  {:>7} pass shape",
+                group(*length),
+                group(stat.accounts),
+                group(stat.passed)
+            );
+        }
+        if let Some(spec) = find_by_discriminator(sample.discriminator) {
+            let _ = writeln!(
+                text,
+                "  registry      {} expects {} bytes at the current layout",
+                spec.account_type,
+                group(spec.data_len)
+            );
+        }
+        if sample.report.failed() > 0 {
+            let _ = writeln!(
+                text,
+                "  {}  {} fetched account(s) fail the shape check",
+                paint("1;31", "FAIL"),
+                group(sample.report.failed())
+            );
+            let _ = writeln!(
+                text,
+                "        the registry's rule no longer matches what the program writes"
+            );
+        }
+    }
+    let _ = writeln!(text);
+    text
+}
+
+/// Machine output for the sentinel.
+fn sentinel_json(
+    program: &str,
+    upgrade: &ProgramUpgrade,
+    sample: Option<&SentinelSample>,
+    since: Option<u64>,
+) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "program": program,
+        "upgradeable": true,
+        "deploy_slot": upgrade.deploy_slot,
+        "upgrade_authority": upgrade.upgrade_authority,
+        "slot_range_filter": {
+            "new_layout_from": format!("SlotRangeFilter::from({}, None)", upgrade.deploy_slot),
+            "old_layout_to": format!("SlotRangeFilter::to({}, None)", upgrade.deploy_slot),
+        },
+    });
+    if let Some(since) = since {
+        json["since"] = serde_json::json!(since);
+        json["deployed_after_since"] = serde_json::json!(upgrade.deploy_slot > since);
+    }
+    if let Some(sample) = sample {
+        json["sample"] = serde_json::json!({
+            "discriminator": hex8(&sample.discriminator),
+            "account_type": sample.account_type,
+            "matched": sample.report.matched,
+            "fetched": sample.report.fetched,
+            "failed_shape": sample.report.failed(),
+            "lengths": sample
+                .report
+                .lengths
+                .iter()
+                .map(|(length, stat)| serde_json::json!({
+                    "length": length,
+                    "accounts": stat.accounts,
+                    "shape_pass": stat.passed,
+                }))
+                .collect::<Vec<_>>(),
+        });
+    }
+    json
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use karat67::upgrade::LengthStat;
 
     #[test]
     fn account_report_names_the_failing_stage() {
@@ -922,5 +1221,101 @@ mod tests {
         let json = gaps_json(&report, Some(std::path::Path::new("/tmp/gaps.txt")));
         assert!(json.get("gaps").is_none());
         assert_eq!(json["out"], "/tmp/gaps.txt");
+    }
+
+    #[test]
+    fn sentinel_report_prints_the_carbon_boundary() {
+        let upgrade = ProgramUpgrade {
+            deploy_slot: 440_486_775,
+            upgrade_authority: Some("GzFgdRJXmawPhGeBsyRCDLx4jAKPsvbUqoqitzppkzkW".to_string()),
+        };
+        let text = render_sentinel(
+            "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+            &upgrade,
+            None,
+        );
+        assert!(text.contains("SlotRangeFilter::from(440486775, None)"));
+        assert!(text.contains("SlotRangeFilter::to(440486775, None)"));
+        assert!(text.contains("440,486,775"));
+        assert!(text.contains("GzFgdRJXmawPhGeBsyRCDLx4jAKPsvbUqoqitzppkzkW"));
+
+        let immutable = ProgramUpgrade {
+            deploy_slot: 7,
+            upgrade_authority: None,
+        };
+        assert!(render_sentinel("prog", &immutable, None).contains("none (immutable)"));
+
+        let json = sentinel_json("prog", &immutable, None, Some(10));
+        assert_eq!(json["deploy_slot"], 7);
+        assert_eq!(json["deployed_after_since"], false);
+        assert_eq!(json["upgrade_authority"], serde_json::Value::Null);
+        let json = sentinel_json("prog", &immutable, None, Some(5));
+        assert_eq!(json["deployed_after_since"], true);
+        assert_eq!(
+            json["slot_range_filter"]["old_layout_to"],
+            "SlotRangeFilter::to(7, None)"
+        );
+    }
+
+    #[test]
+    fn sentinel_sample_report_counts_lengths_and_failures() {
+        let mut lengths = std::collections::BTreeMap::new();
+        lengths.insert(
+            245,
+            LengthStat {
+                accounts: 198,
+                passed: 198,
+            },
+        );
+        lengths.insert(
+            243,
+            LengthStat {
+                accounts: 2,
+                passed: 0,
+            },
+        );
+        let sample = SentinelSample {
+            discriminator: [241, 154, 109, 4, 17, 177, 109, 188],
+            account_type: Some("Pool".to_string()),
+            report: SampleReport {
+                matched: 1_234_567,
+                fetched: 200,
+                lengths,
+            },
+        };
+        let upgrade = ProgramUpgrade {
+            deploy_slot: 100,
+            upgrade_authority: None,
+        };
+        let text = render_sentinel("prog", &upgrade, Some(&sample));
+        assert!(text.contains("f19a6d0411b16dbc"));
+        assert!(text.contains("1,234,567 accounts"));
+        assert!(text.contains("2 fetched account(s) fail"));
+
+        let json = sentinel_json("prog", &upgrade, Some(&sample), None);
+        assert_eq!(json["sample"]["failed_shape"], 2);
+        assert_eq!(json["sample"]["matched"], 1234567);
+        assert_eq!(json["sample"]["lengths"][0]["length"], 243);
+        assert_eq!(json["sample"]["lengths"][1]["shape_pass"], 198);
+    }
+
+    #[test]
+    fn sample_targets_resolve_or_error() {
+        let (disc, name) = sample_target(Some("Obligation"), None).expect("registered");
+        assert_eq!(disc, [168, 206, 141, 106, 88, 76, 172, 167]);
+        assert_eq!(name.as_deref(), Some("Obligation"));
+
+        let (disc, name) = sample_target(None, Some("0xF19A6D0411B16DBC")).expect("raw hex");
+        assert_eq!(disc, [241, 154, 109, 4, 17, 177, 109, 188]);
+        assert_eq!(name, None);
+
+        assert!(sample_target(None, None).is_err());
+        assert!(sample_target(Some("NotAType"), None).is_err());
+        assert!(parse_discriminator_hex("f19a").is_err());
+        assert!(parse_discriminator_hex("zzzzzzzzzzzzzzzz").is_err());
+        assert_eq!(
+            hex8(&[241, 154, 109, 4, 17, 177, 109, 188]),
+            "f19a6d0411b16dbc"
+        );
     }
 }

@@ -18,6 +18,7 @@ pub mod gate;
 #[cfg(feature = "rpc")]
 pub mod mcp;
 pub mod report;
+pub mod upgrade;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
