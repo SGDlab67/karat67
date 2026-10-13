@@ -64,6 +64,15 @@ pub trait SlotCoverageFetcher {
 /// inside the fetcher, which is where every caller inherits it.
 pub const MAX_GETBLOCKS_RANGE: u64 = 500_000;
 
+/// Response size ceiling for one RPC call.
+///
+/// A 500,000-slot `getBlocks` window is several megabytes of digits, and a
+/// program-wide `getProgramAccounts` key list is tens of megabytes (measured
+/// 2026-10-12: pump_swap's `Pool` match list is about 50 MB). ureq's default
+/// body cap of 10 MB refuses both, so the ceiling is raised once, for every
+/// call, in one place.
+pub const MAX_RPC_BODY_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Inclusive windows of at most `max` slots covering `[start, end]`.
 ///
 /// Ascending and non-overlapping, and they tile the range exactly: each
@@ -223,6 +232,134 @@ impl RpcAccountFetcher {
             endpoint: endpoint.into(),
             agent: ureq::Agent::new_with_defaults(),
         }
+    }
+
+    /// One JSON-RPC call, returning the `result` value.
+    ///
+    /// Every request in this file goes through here, so the two failure
+    /// shapes (an RPC `error` object, a missing `result`) are handled once.
+    fn rpc_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+
+        let mut response = self
+            .agent
+            .post(&self.endpoint)
+            .send_json(&request)
+            .map_err(|e| anyhow::anyhow!("{method} request failed: {e}"))?;
+        let body: serde_json::Value = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_RPC_BODY_BYTES)
+            .read_json()
+            .map_err(|e| anyhow::anyhow!("reading {method} response failed: {e}"))?;
+
+        if let Some(error) = body.get("error") {
+            anyhow::bail!("RPC returned an error: {error}");
+        }
+        body.get("result")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("RPC response missing `result`"))
+    }
+
+    /// `getAccountInfo` with `jsonParsed`, for accounts whose parsed form is
+    /// the point. An upgradeable program's `programData` address comes back
+    /// as a base58 string here, so reading it needs no base58 decoder.
+    ///
+    /// `Ok(None)` means the account does not exist.
+    pub fn get_parsed_account_info(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let result = self.rpc_call(
+            "getAccountInfo",
+            serde_json::json!([key, { "encoding": "jsonParsed" }]),
+        )?;
+        Ok(result.get("value").filter(|v| !v.is_null()).cloned())
+    }
+
+    /// `getAccountInfo` for `[offset, offset + length)` of an account's data,
+    /// base64 decoded.
+    ///
+    /// The slice is what keeps a ProgramData read from downloading the
+    /// program's code: only the bincode header is requested.
+    ///
+    /// `Ok(None)` means the account does not exist.
+    pub fn get_account_bytes(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        use base64::Engine as _;
+
+        let result = self.rpc_call(
+            "getAccountInfo",
+            serde_json::json!([
+                key,
+                {
+                    "encoding": "base64",
+                    "dataSlice": { "offset": offset, "length": length },
+                }
+            ]),
+        )?;
+        let Some(value) = result.get("value").filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        let encoded = value
+            .get("data")
+            .and_then(|data| data.get(0))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("account `data` is not [base64, \"base64\"]"))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| anyhow::anyhow!("decoding base64 account data failed: {e}"))?;
+        Ok(Some(bytes))
+    }
+
+    /// Keys of every account `program` owns whose first 8 bytes equal the
+    /// base58-encoded `discriminator`, with no account data returned
+    /// (`dataSlice` of length 0).
+    ///
+    /// This is the `getProgramAccounts` shape a survey wants: it lists what
+    /// matches without paying for the payloads, which the caller then samples
+    /// through [`AccountFetcher::get_multiple_accounts`].
+    pub fn get_program_account_keys(
+        &self,
+        program: &str,
+        discriminator_base58: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let result = self.rpc_call(
+            "getProgramAccounts",
+            serde_json::json!([
+                program,
+                {
+                    "encoding": "base64",
+                    "filters": [
+                        { "memcmp": { "offset": 0, "bytes": discriminator_base58 } }
+                    ],
+                    "dataSlice": { "offset": 0, "length": 0 },
+                }
+            ]),
+        )?;
+        let entries = result
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("getProgramAccounts result is not an array"))?;
+        entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("pubkey")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("getProgramAccounts entry missing `pubkey`"))
+            })
+            .collect()
     }
 }
 
