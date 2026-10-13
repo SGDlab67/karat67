@@ -98,10 +98,29 @@ karat gaps \
   --rpc-url https://api.mainnet-beta.solana.com \
   --last-before 250000000 --first-after 250000300 \
   --out gaps.txt
+
+# Sentinel: the slot a program's code last changed at, and the Carbon
+# boundary that follows from it. Two reads: the Program account names its
+# ProgramData account, and 45 bytes of that decode as the header (deploy
+# slot + upgrade authority). No state file, machine code never downloaded.
+# --since <SLOT> exits 1 when the program changed after that slot.
+karat sentinel \
+  --program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA \
+  --rpc-url https://api.mainnet-beta.solana.com
+
+# Same read, plus a live shape sample: list the accounts carrying a
+# discriminator, fetch a strided sample of them in full, shape-check each,
+# and print the live length distribution. --account-type picks a registered
+# type; --discriminator takes raw hex for a type the registry does not
+# know yet. A registered type whose live accounts fail shape exits 1.
+karat sentinel \
+  --program KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD \
+  --sample 20 --account-type Obligation \
+  --rpc-url https://api.mainnet-beta.solana.com
 ```
 
-On a terminal, `shape`, `account`, `completeness`, `orphans` and `gaps` print a
-readable report; piped (or with `--json`) they print JSON, one object per
+On a terminal, `shape`, `account`, `completeness`, `orphans`, `gaps` and
+`sentinel` print a readable report; piped (or with `--json`) they print JSON, one object per
 check. `reconcile` always prints JSON. `account` runs shape on the decoded
 bytes and, only when that is Pass, the reconcile check for that account, so a
 bad payload never costs an RPC call. All of these exit non-zero unless every
@@ -119,9 +138,93 @@ not. Only a fetch that could not be made exits 1. The full list lands in
 `--json` (unless `--out` already wrote it) or in the file `--out` names; the
 terminal report lists the first 16 slots and points at `--out` for the rest.
 
+`sentinel` follows the normal exit rule with one extra gate: exit 1 when the
+read fails, when `--since` finds the program changed after that slot, or
+when a sampled registered type fails shape.
+
 The RPC client uses a lightweight, rustls-based HTTP client (`ureq`) instead
 of the full `solana-client` stack, so builds stay toolchain-only with no
 OpenSSL system dependency.
+
+## Upgrades and stale decoders
+
+A program upgrade changes account layouts without changing the discriminator,
+and every decoder written before that slot is silently wrong about the data.
+Carbon can run versioned decoders behind a `SlotRangeFilter`, but only if the
+caller already knows the upgrade slot. `karat sentinel` reads it off the
+chain: two RPC calls, no state file.
+
+```
+$ karat sentinel --program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+
+  karat67  sentinel · pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+
+  deploy slot   454,596,406
+  authority     7gZufwwAo17y5kg8FMyJy2phgpvv9RSdzWtdXiWHjFr8
+
+  carbon boundary, paste into a versioned decoder set:
+    SlotRangeFilter::from(454596406, None)   the current layout, from this slot on
+    SlotRangeFilter::to(454596406, None)     the layout before it
+```
+
+The Program account arrives through `jsonParsed` and names its ProgramData
+account; the first 45 bytes of that account (`dataSlice`) decode as the
+`UpgradeableLoaderState::ProgramData` header, which carries the deploy slot
+and the upgrade authority. The program's machine code is never downloaded.
+
+`--sample N` answers the second half of the question, "is the decoder
+actually stale?": it lists the accounts carrying a discriminator through
+`getProgramAccounts` (a memcmp filter and a zero-byte `dataSlice`, so no
+account data comes back), fetches a strided sample of N of them in full,
+shape-checks each against the registry, and reports the live length
+distribution. The sample is strided because the first N accounts come back
+in node storage order and are not representative. A registered type whose
+live accounts fail shape exits non-zero, and an unregistered discriminator
+cannot pass a shape check at all, so measuring an unknown type reports the
+distribution and still exits non-zero. A large program's key list can be
+tens of megabytes (pump_swap's `Pool` is about 1.5M accounts, about 50 MB of
+keys), so the RPC client raises its response ceiling for calls like this;
+only the sampled accounts are fetched in full.
+
+All five programs karat knows still carry an upgrade authority, read live on
+2026-10-12:
+
+| program | deploy slot | upgrade authority |
+|---|---|---|
+| Kamino Lend | 440,486,775 | GzFgdRJXmawPhGeBsyRCDLx4jAKPsvbUqoqitzppkzkW |
+| Meteora DLMM | 423,977,638 | JADaUV8kvDpDbJr55wxXJHVaBS3VCj8thZZHjfeuCVLd |
+| Meteora DBC | 445,503,633 | JADaUV8kvDpDbJr55wxXJHVaBS3VCj8thZZHjfeuCVLd |
+| Orca Whirlpool | 440,170,207 | GwH3Hiv5mACLX3ufTw1pFsrhSPon5tdw252DBs4Rx4PV |
+| pump_swap | 454,596,406 | 7gZufwwAo17y5kg8FMyJy2phgpvv9RSdzWtdXiWHjFr8 |
+
+Every one of them is still being upgraded by its team, which is the point:
+an integrity check that assumes a frozen layout has an expiry date.
+
+A 200-account sample of pump_swap `Pool` (out of 1,498,885 live) came back
+at eight lengths:
+
+```
+  211 x7      243 x10     244 x6      245 x12
+  271 x1      287 x2      300 x68     301 x94
+```
+
+Those lengths are one append-only layout that grew across program upgrades:
+211 (the original, ending at `lp_supply`), 243 (plus `coin_creator`), 244,
+245 (plus `is_mayhem_mode` and `is_cashback_coin`, which is exactly Carbon's
+struct), 271 (plus `virtual_quote_reserves`, `creator_fee_bps` and two flags),
+287 (the newest published layout, the pump_amm IDL of 2026-10-07), and
+300 / 301 (the 287 layout plus 13 or 14 trailing zero bytes; the SDK
+constant `POOL_ACCOUNT_NEW_SIZE` is 300). Counted against the 1.5M live
+pools: about 10 percent fail Carbon's decoder entirely (Borsh underflow,
+which Carbon reads as "not my account" and drops silently), only 6.8 percent
+match its 245-byte struct exactly, and the rest decode as a silent prefix,
+losing fields like `virtual_quote_reserves` and `creator_fee_bps`. That is
+decoder staleness seen from the outside, with receipts. `Pool` is
+deliberately not in the registry yet: six-plus era layouts, and the tail
+semantics of the newest two still open. A rule that cannot be defended
+against the live distribution is worse than a documented gap. For layouts
+that do split by slot and are understood, `AccountSpec.len_eras` carries one
+legal length per era and `len_at(slot)` resolves it.
 
 ## Run it in CI
 
@@ -228,6 +331,12 @@ cargo run --quiet --bin karat-mcp
   two `getBlocks` calls, because the fetcher chunks at the RPC's 500,000-slot
   cap, so the 158.91 h outage (about 1.4M slots) would be three. The
   off-by-one is drafted upstream in `updates/carbon-missed-slots-draft.md`.
+- `karat sentinel` (done): the slot a program last changed at, from its
+  ProgramData header in two reads, printed as the Carbon `SlotRangeFilter`
+  boundary to paste, plus `--sample N` to measure what a program actually
+  writes. All five known programs read clean; a 200-account `Pool` sample
+  came back at eight live lengths (2026-10-12), which is why no `Pool` row
+  is registered yet.
 - IDL-driven account specs (done for Kamino Lend, Meteora DBC, Meteora DLMM
   and Orca Whirlpool, 29 types): new account types are `AccountSpec` data and
   the `Check` trait is the uniform seam. Each program after the first cost one
