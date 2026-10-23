@@ -22,9 +22,10 @@ pub fn all_pass(results: &[CheckResult]) -> bool {
 /// `indexed` is the indexed payload itself. This does not rebuild a
 /// discriminator or pad to an IDL length. When shape is not Pass, `fetcher`
 /// is not called. After Pass, a missing fetcher is a Skipped reconcile result,
-/// never a second Pass. Slot-lag rules are [`reconcile`]'s: delta 0 or a
-/// missing indexed slot is a hard mismatch Fail; `0 < delta <= max_slot_lag`
-/// is Skipped.
+/// never a second Pass. Mismatch rules are [`reconcile`]'s: the account's
+/// last touch decides when the node knows it, and the slot-lag window (delta
+/// 0 or a missing indexed slot is Fail, `0 < delta <= max_slot_lag` is
+/// Skipped) only when it does not.
 pub fn check_account(
     account: &str,
     indexed: &[u8],

@@ -30,6 +30,18 @@ mainnet through PublicNode's free endpoint, or yours.
    indexer lag: a mismatch within the window is `Skipped` with a JSON reason
    (`"reason":"slot lag"`), never `Pass`. Beyond the window, or with no write
    slot, a mismatch is still `Fail`.
+   With `--indexed-slot`, a mismatch first asks the chain when the account
+   was last touched (`getSignaturesForAddress`, limit 1, pinned with
+   `minContextSlot` to the read). Untouched since the indexed slot means the
+   bytes cannot have legitimately changed: `Fail` at any lag, with
+   `last_touch_slot` in the detail. Touched after it means the indexer is
+   behind on that account: `Skipped` with `"reason":"written after indexed
+   slot"`, at any lag. Read-only references count as touches, so the answer
+   errs toward skipping, never toward a false `Fail`. Only when the node has
+   no history for the account does the slot-lag window decide. A chain read
+   older than the indexed slot (a lagging node behind a load balancer) is
+   `Skipped` with `"reason":"rpc behind index"`, never `Fail`. Accounts are
+   read at `confirmed`, 100 keys per `getMultipleAccounts` call.
 3. **Completeness** - indexed slot set compared against Solana `getBlocks`
    for a window, not a contiguous slot range. Leaders skip slots; heights
    omitted by `getBlocks` are not gaps. Missing = produced slots minus
@@ -37,6 +49,14 @@ mainnet through PublicNode's free endpoint, or yours.
 4. **Orphans** - the mirror of completeness: indexed slots inside the window
    that `getBlocks` never produced. Catches state written for a slot that was
    skipped or forked away, which is what indexing at `processed` risks.
+
+Completeness and orphans stop at the finalized slot (`getSlot`, finalized),
+because `getBlocks` answers at `finalized`: above it, absent means "not final
+yet", not "never produced". If the window runs past it, a clean result is
+`Skipped` with `"reason":"not finalized"` rather than `Pass`, and a gap or
+orphan below it is still `Fail`. On mainnet in October 2026 the finalized slot
+read within one slot of `processed` on two providers, so this rarely bites
+there; it matters on lagging nodes and slower clusters.
 
 Freshness and liveness are out of scope by design: every indexer already
 has them.
