@@ -16,6 +16,63 @@ Kamino, Meteora or Orca account, damage the stored copy, and watch shape and
 reconcile catch it. The page runs this crate compiled to WebAssembly and reads
 mainnet through PublicNode's free endpoint, or yours.
 
+## Inspect: one call before you act on an account
+
+```bash
+karat inspect --account Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE \
+  --rpc-url https://solana-rpc.publicnode.com
+```
+
+```
+  OK  Orca Whirlpool Whirlpool at a legal length, layout verified against the current deploy
+
+  type           Orca Whirlpool Whirlpool
+  length         653 bytes
+  read at slot   460,593,973
+  deploy slot    457,152,296  (registry verified at 457,152,296)
+
+    fee_rate                       400
+    sqrt_price                     5945506145713508477
+    tick_current_index             -22647
+    token_mint_a                   So11111111111111111111111111111111111111112
+    token_mint_b                   EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+    ...
+```
+
+`inspect` reads an account and returns what it is, what it holds, and one
+verdict on whether to trust the decode:
+
+| verdict | meaning |
+|---|---|
+| `ok` | registered type, legal length, layout verified against the program as deployed now |
+| `stale_registry` | the program was redeployed after its layouts were verified: fields are decoded and may be wrong |
+| `layout_mismatch` | registered type at a length its rule forbids |
+| `unknown_layout` | owned by a covered program under a discriminator the registry does not have: a new account kind, or one an upgrade added |
+| `unregistered_program` | owned by a program karat does not cover; nothing is claimed |
+| `missing` | no account at that address |
+
+Lookup is keyed on the owner first, then the discriminator, so a struct name
+two programs share (`Oracle`, `Position`) is never read with the wrong
+program's layout. The deploy check is what keeps `ok` honest over time: each
+covered program records the deploy slot its layouts were last verified
+against, and any later deploy downgrades the verdict until someone rechecks.
+Three of the four covered programs were redeployed between 2026-10-12 and
+2026-10-23; the layouts were rechecked against live accounts of the new
+deploys before the baseline moved.
+
+Decoded today: Kamino `Obligation`, `Reserve`, `LendingMarket`; Orca
+`Whirlpool`, `Position`; Meteora DLMM `LbPair`; Meteora DBC `VirtualPool`
+(the fields an agent acts on: mints, vaults, reserves, prices, ticks). Every
+offset was confirmed on live accounts: pubkeys resolve to accounts of the
+right kind, and the SOL/USDC Whirlpool and DLMM pools decode to the same
+price. The other 22 registered types are identified and shape-checked, with
+fields not decoded yet. Integers wider than 32 bits come back as decimal
+strings so JavaScript readers do not lose precision.
+
+Pass `--indexed-base64` (and `--indexed-slot`) to reconcile your stored copy
+in the same call. Exit 0 only when the verdict is `ok` and the copy matches.
+The same call is the `inspect_account` MCP tool.
+
 ## Checks
 
 1. **Shape** - account data length and discriminator against the program IDL.
@@ -41,7 +98,8 @@ mainnet through PublicNode's free endpoint, or yours.
    no history for the account does the slot-lag window decide. A chain read
    older than the indexed slot (a lagging node behind a load balancer) is
    `Skipped` with `"reason":"rpc behind index"`, never `Fail`. Accounts are
-   read at `confirmed`, 100 keys per `getMultipleAccounts` call.
+   read at `confirmed`, 100 keys per `getMultipleAccounts` call, or fewer
+   when the endpoint names a lower cap (PublicNode's free tier allows 10).
 3. **Completeness** - indexed slot set compared against Solana `getBlocks`
    for a window, not a contiguous slot range. Leaders skip slots; heights
    omitted by `getBlocks` are not gaps. Missing = produced slots minus
@@ -207,7 +265,9 @@ keys), so the RPC client raises its response ceiling for calls like this;
 only the sampled accounts are fetched in full.
 
 All five programs karat knows still carry an upgrade authority, read live on
-2026-10-12:
+2026-10-12 (by 2026-10-23 Kamino Lend, Meteora DBC and Orca Whirlpool had
+been redeployed again, at 458,858,791, 457,502,600 and 457,152,296; see
+`PROGRAMS` in `src/checks/specs.rs`):
 
 | program | deploy slot | upgrade authority |
 |---|---|---|
@@ -319,7 +379,11 @@ shape check, and `gate_account` is the same gate as `karat account`
 ## MCP
 
 `karat-mcp` is a stdio JSON-RPC server (`initialize`, `tools/list`,
-`tools/call`) with two tools. `check_account` matches `karat account`:
+`tools/call`) with three tools. `inspect_account` matches `karat inspect`:
+`account`, optional `indexed_base64`, `indexed_slot`, `max_slot_lag`, and
+`rpc_url` (or `KARAT_RPC_URL`); its text is the inspection JSON, and a
+non-`ok` verdict is an answer (`isError` false), not a failed call, so an
+agent branches on `verdict` instead of retrying. `check_account` matches `karat account`:
 `account`, `indexed_base64`, optional `indexed_slot`, `max_slot_lag` (default
 32), and `rpc_url` (or `KARAT_RPC_URL`). Shape runs first; reconcile runs only
 after Pass, so a bad payload never calls RPC. `find_gaps` matches `karat gaps`:
@@ -368,7 +432,9 @@ cargo run --quiet --bin karat-mcp
   program: DLMM and Whirlpool both define `Oracle` at different lengths, so
   lookup has to key on the owner before either can be registered. Coverage of
   a snapshot is not an "accounts for all" claim.
-- Owner-aware lookup, keyed on `(program, discriminator)`. Across Carbon's
+- Owner-aware lookup, keyed on `(program, discriminator)` (done for
+  `inspect` through `find_owned`; `shape` and `KaratDecoder` still look up by
+  discriminator alone). Across Carbon's
   decoders, 106 of 263 account types share a discriminator with another
   program ([evidence](evidence/carbon-discriminators.md)), and 5 registered
   types are among them.

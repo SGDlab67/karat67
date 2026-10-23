@@ -59,8 +59,9 @@
 //! registered program's rule. Across Carbon's decoders, 106 of 263 account
 //! types share a discriminator with another program
 //! (`evidence/carbon-discriminators.md`).
-// ponytail: discriminator-only lookup. Key on (owner, discriminator) once a
-// caller always has the owner; `KaratDecoder` does, the CLI does only via RPC.
+// ponytail: `find_owned` keys on (owner, discriminator) and `inspect` uses
+// it. `check_shape` still takes bytes alone; `KaratDecoder` has the owner and
+// should move to `find_owned` next.
 
 /// How an account type's `data_len` constrains an observed payload.
 ///
@@ -481,6 +482,64 @@ pub const ORCA_WHIRLPOOL_ACCOUNTS: &[AccountSpec] = &[
     },
 ];
 
+/// One program the registry covers, and the deploy its layouts were last
+/// verified against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramSpec {
+    /// Display name, the same string [`AccountSpec::program`] carries.
+    pub name: &'static str,
+    /// Base58 program id: the owner every account of this program carries.
+    pub id: &'static str,
+    /// The program's deploy slot when its rows were last checked against live
+    /// accounts. A later deploy means the program's code changed after the
+    /// registry last looked, so its layouts are unconfirmed until rechecked.
+    pub verified_deploy_slot: u64,
+}
+
+/// Programs the registry covers.
+///
+/// Verified 2026-10-23: each deploy slot is the live ProgramData header that
+/// day, and the registered lengths plus the decoded field offsets in
+/// [`crate::layout`] were checked against live accounts of that deploy
+/// (mints resolve to mint accounts, vaults to token accounts, the Whirlpool
+/// and DLMM SOL/USDC prices agree).
+pub const PROGRAMS: &[ProgramSpec] = &[
+    ProgramSpec {
+        name: "Kamino Lend",
+        id: "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD",
+        verified_deploy_slot: 458_858_791,
+    },
+    ProgramSpec {
+        name: "Meteora DBC",
+        id: "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN",
+        verified_deploy_slot: 457_502_600,
+    },
+    ProgramSpec {
+        name: "Meteora DLMM",
+        id: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
+        verified_deploy_slot: 423_977_638,
+    },
+    ProgramSpec {
+        name: "Orca Whirlpool",
+        id: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+        verified_deploy_slot: 457_152_296,
+    },
+];
+
+/// The registered program with this base58 id.
+pub fn find_program(id: &str) -> Option<&'static ProgramSpec> {
+    PROGRAMS.iter().find(|program| program.id == id)
+}
+
+/// Owner-aware lookup: the spec `program` registers under `discriminator`.
+///
+/// A discriminator names a struct, not a program (`Oracle` is both a DLMM and
+/// a Whirlpool type), so a caller that knows the owner should ask this rather
+/// than [`find_by_discriminator`].
+pub fn find_owned(program: &ProgramSpec, discriminator: [u8; 8]) -> Option<&'static AccountSpec> {
+    all_specs().find(|spec| spec.program == program.name && spec.discriminator == discriminator)
+}
+
 /// Every registered spec across all program tables, in registry order.
 pub fn all_specs() -> impl Iterator<Item = &'static AccountSpec> {
     KAMINO_ACCOUNTS
@@ -508,6 +567,30 @@ pub fn account_type_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_spec_belongs_to_a_registered_program() {
+        for spec in all_specs() {
+            assert!(
+                PROGRAMS.iter().any(|program| program.name == spec.program),
+                "{} names unregistered program {}",
+                spec.account_type,
+                spec.program
+            );
+        }
+    }
+
+    #[test]
+    fn owner_aware_lookup_keeps_programs_apart() {
+        let whirlpool = find_program("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc").unwrap();
+        let kamino = find_program("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD").unwrap();
+        let position = find_by_account_type("Position").unwrap();
+        assert_eq!(
+            find_owned(whirlpool, position.discriminator).map(|s| s.account_type),
+            Some("Position")
+        );
+        assert_eq!(find_owned(kamino, position.discriminator), None);
+    }
 
     #[test]
     fn registry_has_lending_market_as_data_only_entry() {
