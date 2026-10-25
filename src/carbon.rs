@@ -48,12 +48,12 @@ pub use pipeline::KaratDecoder;
 /// channel: hand it the event and a [`SlotCoverageFetcher`]
 /// ([`RpcAccountFetcher`](crate::fetch::RpcAccountFetcher) in production,
 /// [`MockFetcher`](crate::fetch::MockFetcher) in tests) and get the produced
-/// blocks in the open interval it names.
+/// blocks in the closed range it names, both boundary slots included.
 ///
-/// Carbon's own `missed_slots` field is an estimate: it counts leader
-/// skip-slots, includes both observed ends, and is sent with `try_send`, so
-/// the event itself can be dropped. This is the list those slots can
-/// actually be backfilled from.
+/// Carbon's own `missed_slots` field is a height delta: it counts leader
+/// skip-slots, is one short of the closed range, and is sent with
+/// `try_send`, so the event itself can be dropped (sevenlabs-hq/carbon#609).
+/// This is the list those slots can actually be backfilled from.
 ///
 /// [`SlotCoverageFetcher`]: crate::fetch::SlotCoverageFetcher
 #[cfg(feature = "carbon")]
@@ -84,26 +84,26 @@ mod disconnection_tests {
             // Carbon's estimate for this window: 106 - 99.
             missed_slots: 7,
         };
-        // The chain produced 100, 101, 103, 104; 102 was a leader skip.
-        let fetcher = MockFetcher::new(0).with_blocks([100, 101, 103, 104]);
+        // The chain produced 99..=106 except 102 and 105, which were leader
+        // skips. Both boundary blocks are in the list.
+        let fetcher = MockFetcher::new(0).with_blocks([99, 100, 101, 103, 104, 106]);
         let gaps = gaps_for_disconnection(&event, &fetcher).expect("reachable");
-        assert_eq!(gaps, vec![100, 101, 103, 104]);
+        assert_eq!(gaps, vec![99, 100, 101, 103, 104, 106]);
         assert_eq!(event.missed_slots, 7);
 
-        // Adjacent slots: Carbon still reports 1 missed slot, the interval
-        // is empty, and no fetch happens at all.
+        // Adjacent slots: Carbon reports 1 missed slot, but both boundary
+        // blocks may be partly delivered, so both are re-fetched.
         let adjacent = DatasourceDisconnection {
             last_slot_before_disconnect: 100,
             first_slot_after_reconnect: 101,
             missed_slots: 1,
             ..event
         };
-        let fetcher = MockFetcher::new(0);
+        let fetcher = MockFetcher::new(0).with_blocks([100, 101]);
         assert_eq!(
             gaps_for_disconnection(&adjacent, &fetcher).expect("reachable"),
-            Vec::<u64>::new()
+            vec![100, 101]
         );
-        assert_eq!(fetcher.block_fetches(), 0);
     }
 }
 

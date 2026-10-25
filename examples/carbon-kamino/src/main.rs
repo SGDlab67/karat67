@@ -87,13 +87,13 @@ fn main() -> anyhow::Result<()> {
     // channel becomes the exact backfill list for the window it names.
     let first_after = fetched.context_slot.saturating_sub(64);
     let last_before = first_after.saturating_sub(160);
-    println!("\n  disconnect window ({last_before}, {first_after}):");
+    println!("\n  disconnect window [{last_before}, {first_after}]:");
     let backfill = wire_disconnects(&rpc, last_before, first_after)?;
     assert!(
         backfill
             .iter()
-            .all(|slot| *slot > last_before && *slot < first_after),
-        "every backfill slot is inside the open interval"
+            .all(|slot| *slot >= last_before && *slot <= first_after),
+        "every backfill slot is inside the closed range"
     );
     assert!(
         backfill.windows(2).all(|pair| pair[0] < pair[1]),

@@ -114,7 +114,8 @@ enum Command {
     /// Gaps: the exact backfill list after a stream reconnect. Takes the two
     /// slots a disconnecting datasource knows (Carbon's
     /// `DatasourceDisconnection`: last slot before the drop, first slot after
-    /// the reconnect) and lists every produced block strictly between them.
+    /// the reconnect) and lists every produced block from one to the other,
+    /// both ends included, since either boundary slot can be partly delivered.
     ///
     /// Exit code: 0 whenever the list was computed, non-empty or not. The
     /// list is the deliverable here, not a verdict. A fetch that cannot be
@@ -126,8 +127,8 @@ enum Command {
         /// Last slot the stream processed before it dropped.
         #[arg(long)]
         last_before: u64,
-        /// First slot the stream processed after it reconnected. Must be
-        /// greater than `--last-before`.
+        /// First slot the stream processed after it reconnected. Must not be
+        /// less than `--last-before`.
         #[arg(long)]
         first_after: u64,
         /// Write the full list to this file, one slot per line, instead of
@@ -359,9 +360,9 @@ fn main() -> anyhow::Result<()> {
             first_after,
             out,
         } => {
-            if first_after <= last_before {
+            if first_after < last_before {
                 anyhow::bail!(
-                    "--first-after {first_after} must be greater than --last-before {last_before}"
+                    "--first-after {first_after} must not be less than --last-before {last_before}"
                 );
             }
 
@@ -371,7 +372,7 @@ fn main() -> anyhow::Result<()> {
                 Err(error) => {
                     // Skipped is never green: a fetch that could not run
                     // exits non-zero here too, in both output modes.
-                    let name = format!("gaps(({last_before}, {first_after}))");
+                    let name = format!("gaps([{last_before}, {first_after}])");
                     let result = CheckResult::skipped(name, format!("fetch unreachable: {error}"));
                     if cli.json || !std::io::stdout().is_terminal() {
                         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -991,16 +992,16 @@ const GAP_SAMPLE_LIMIT: usize = 16;
 struct GapReport {
     last_before: u64,
     first_after: u64,
-    /// Produced blocks in the open interval: the backfill list.
+    /// Produced blocks in the closed range: the backfill list.
     gaps: Vec<u64>,
-    /// Heights in the open interval with no block: leader skip-slots.
+    /// Heights in the closed range with no block: leader skip-slots.
     skipped: u64,
 }
 
 impl GapReport {
-    /// Carbon's own estimate, for the side-by-side: `first - last` counts
-    /// every height between the two observed slots with both ends included,
-    /// and cannot tell a produced block from a skip-slot.
+    /// Carbon's own estimate, for the side-by-side: `first - last` is one
+    /// short of the `first - last + 1` heights in the closed range, and
+    /// cannot tell a produced block from a skip-slot.
     fn carbon_missed_slots(&self) -> u64 {
         self.first_after.saturating_sub(self.last_before)
     }
@@ -1008,10 +1009,10 @@ impl GapReport {
 
 /// Build the report from the boundary slots and the produced list.
 ///
-/// Callers pass `first_after > last_before` (the CLI rejects anything else);
-/// an adjacent pair is the empty interval and every count here is 0.
+/// Callers pass `first_after >= last_before` (the CLI rejects anything
+/// else), so the closed range always holds at least one height.
 fn gap_report(last_before: u64, first_after: u64, gaps: Vec<u64>) -> GapReport {
-    let window = first_after - last_before - 1;
+    let window = first_after - last_before + 1;
     let skipped = window.saturating_sub(gaps.len() as u64);
     GapReport {
         last_before,
@@ -1027,9 +1028,9 @@ fn gaps_json(report: &GapReport, out: Option<&std::path::Path>) -> serde_json::V
     let mut json = serde_json::json!({
         "last_before": report.last_before,
         "first_after": report.first_after,
-        "window_start": report.last_before + 1,
-        "window_end": report.first_after - 1,
-        "window_slots": report.first_after - report.last_before - 1,
+        "window_start": report.last_before,
+        "window_end": report.first_after,
+        "window_slots": report.first_after - report.last_before + 1,
         "produced_blocks": report.gaps.len(),
         "skipped_slots": report.skipped,
         "carbon_missed_slots": report.carbon_missed_slots(),
@@ -1069,9 +1070,9 @@ fn render_gaps(report: &GapReport, out: Option<&std::path::Path>) -> String {
     let _ = writeln!(
         text,
         "  window      {:>6} slots    [{}..={}]",
-        group(report.first_after - report.last_before - 1),
-        group(report.last_before + 1),
-        group(report.first_after - 1)
+        group(report.first_after - report.last_before + 1),
+        group(report.last_before),
+        group(report.first_after)
     );
     let _ = writeln!(
         text,
@@ -1085,7 +1086,7 @@ fn render_gaps(report: &GapReport, out: Option<&std::path::Path>) -> String {
     );
     let _ = writeln!(
         text,
-        "  carbon      {:>6} slots    first minus last: counts both ends and skip-slots, names nothing",
+        "  carbon      {:>6} slots    first minus last: one short of the range, counts skip-slots, names nothing",
         group(report.carbon_missed_slots())
     );
     let _ = writeln!(text);
@@ -1358,36 +1359,45 @@ mod tests {
 
     #[test]
     fn gaps_report_counts_blocks_skips_and_carbons_estimate() {
-        // Window (99, 106) covers heights 100..=105; the chain produced four
-        // of them (102 was a leader skip), so two heights are skip-slots.
-        let report = gap_report(99, 106, vec![100, 101, 103, 104]);
+        // Window [99, 106] covers heights 99..=106; the chain produced six
+        // of them (102 and 105 were leader skips).
+        let report = gap_report(99, 106, vec![99, 100, 101, 103, 104, 106]);
         assert_eq!(report.skipped, 2);
-        // Carbon: 106 - 99 = 7. It over-counts the four real blocks by three:
-        // one off-by-one against its own doc comment, plus the two skips.
+        // Carbon: 106 - 99 = 7, one short of the 8 heights in the range, and
+        // it counts the two skips as missed.
         assert_eq!(report.carbon_missed_slots(), 7);
 
         let text = render_gaps(&report, None);
-        assert!(text.contains("[100..=105]"));
-        assert!(text.contains("100 101 103 104"));
-        assert!(text.contains("4 blocks"));
+        assert!(text.contains("[99..=106]"));
+        assert!(text.contains("99 100 101 103 104 106"));
+        assert!(text.contains("6 blocks"));
         assert!(text.contains("7 slots"));
 
         let json = gaps_json(&report, None);
-        assert_eq!(json["window_slots"], 6);
-        assert_eq!(json["gap_count"], 4);
+        assert_eq!(json["window_start"], 99);
+        assert_eq!(json["window_end"], 106);
+        assert_eq!(json["window_slots"], 8);
+        assert_eq!(json["gap_count"], 6);
         assert_eq!(json["skipped_slots"], 2);
         assert_eq!(json["carbon_missed_slots"], 7);
-        assert_eq!(json["gaps"], serde_json::json!([100, 101, 103, 104]));
+        assert_eq!(
+            json["gaps"],
+            serde_json::json!([99, 100, 101, 103, 104, 106])
+        );
 
-        // Adjacent slots: the empty interval. Carbon's formula still claims
-        // one missed slot, which is the off-by-one in its doc comment.
-        let adjacent = gap_report(100, 101, vec![]);
+        // Adjacent slots: Carbon claims one missed slot, but both boundary
+        // blocks may be partly delivered, so the backfill is two.
+        let adjacent = gap_report(100, 101, vec![100, 101]);
         assert_eq!(adjacent.skipped, 0);
         assert_eq!(adjacent.carbon_missed_slots(), 1);
         let json = gaps_json(&adjacent, None);
-        assert_eq!(json["window_slots"], 0);
-        assert_eq!(json["gap_count"], 0);
-        assert!(render_gaps(&adjacent, None).contains("nothing to backfill"));
+        assert_eq!(json["window_slots"], 2);
+        assert_eq!(json["gap_count"], 2);
+
+        // Neither boundary block exists (both forked off): nothing to fetch.
+        let empty = gap_report(100, 101, vec![]);
+        assert_eq!(empty.skipped, 2);
+        assert!(render_gaps(&empty, None).contains("nothing to backfill"));
 
         // With --out, the list is a file and the JSON says which one.
         let json = gaps_json(&report, Some(std::path::Path::new("/tmp/gaps.txt")));

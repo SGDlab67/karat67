@@ -103,7 +103,7 @@ fn tools_list() -> Value {
             }
         }, {
             "name": "find_gaps",
-            "description": "List the blocks the chain produced strictly between the two slots a disconnecting stream reports (last slot before the drop, first slot after the reconnect). The exact backfill list; gap_count 0 means nothing was missed.",
+            "description": "List the blocks the chain produced in the closed range between the two slots a disconnecting stream reports (last slot before the drop, first slot after the reconnect). Both ends are included because either can be partly delivered. The exact backfill list; gap_count 0 means nothing was missed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -186,8 +186,8 @@ fn run_inspect_account(args: &Value) -> Result<Value, String> {
 fn run_find_gaps(args: &Value) -> Result<Value, String> {
     let last_before = optional_u64(args, "last_before")?.ok_or("missing last_before")?;
     let first_after = optional_u64(args, "first_after")?.ok_or("missing first_after")?;
-    if first_after <= last_before {
-        return Err("first_after must be greater than last_before".to_string());
+    if first_after < last_before {
+        return Err("first_after must not be less than last_before".to_string());
     }
     let url = rpc_url_from(args).ok_or("missing rpc_url (or KARAT_RPC_URL)")?;
     let fetcher = RpcAccountFetcher::new(url);

@@ -253,21 +253,21 @@ pub fn check_orphans(
     CheckResult::fail(name, detail.to_string())
 }
 
-/// Produced blocks in the open interval `(last_before, first_after)`: the
+/// Produced blocks in the closed range `[last_before, first_after]`: the
 /// exact backfill list after a stream reconnect.
 ///
 /// A streaming datasource that drops its connection knows two slots: the last
 /// one it processed before the drop and the first one it saw after the
-/// reconnect. Whatever the chain produced strictly between them is what the
-/// indexer missed, in the form it can be replayed.
+/// reconnect. Whatever the chain produced from one to the other is what the
+/// indexer may have missed, in the form it can be replayed.
 ///
-/// The interval is open at both ends because both boundary slots were
-/// observed by the stream: `last_before` was processed before the drop, and
-/// `first_after` is being processed now. Listing either end as a gap would
-/// ask for a backfill of something already in the index.
+/// The range is closed at both ends because, on account and transaction
+/// streams, both boundary slots can be partly delivered: the drop can land
+/// between two transactions of `last_before`, and the new stream can start
+/// partway through `first_after`. Re-fetching a boundary block is a dedup at
+/// worst; skipping one loses whatever the stream did not deliver.
 ///
-/// - An empty interval (adjacent slots, for example) returns an empty list
-///   and makes no RPC call.
+/// - `first_after < last_before` is an empty range: empty list, no RPC call.
 /// - An unreachable fetch is an `Err`, never an empty list: "nothing was
 ///   missed" and "could not check" must not read the same.
 /// - Leader skip-slots are not gaps. They never produced a block, so
@@ -277,12 +277,10 @@ pub fn gap_slots(
     first_after: u64,
     fetcher: &dyn SlotCoverageFetcher,
 ) -> anyhow::Result<Vec<u64>> {
-    let start = last_before.saturating_add(1);
-    let end = first_after.saturating_sub(1);
-    if end < start {
+    if first_after < last_before {
         return Ok(Vec::new());
     }
-    let mut produced = fetcher.get_blocks(start, end)?;
+    let mut produced = fetcher.get_blocks(last_before, first_after)?;
     produced.sort_unstable();
     produced.dedup();
     Ok(produced)
@@ -545,9 +543,18 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_slots_are_an_empty_window_and_make_no_fetch() {
-        let fetcher = MockFetcher::new(0).with_blocks([100, 101, 102]);
+    fn adjacent_slots_backfill_both_boundary_blocks() {
+        // Carbon reports 101 - 100 = 1 missed slot, but the drop can land
+        // inside 100 and the new stream can start inside 101.
+        let fetcher = MockFetcher::new(0).with_blocks([99, 100, 101, 102]);
         let gaps = gap_slots(100, 101, &fetcher).expect("reachable");
+        assert_eq!(gaps, vec![100, 101]);
+    }
+
+    #[test]
+    fn a_reversed_window_is_empty_and_makes_no_fetch() {
+        let fetcher = MockFetcher::new(0).with_blocks([100, 101, 102]);
+        let gaps = gap_slots(101, 100, &fetcher).expect("reachable");
         assert!(gaps.is_empty());
         // The short circuit happens before the fetcher: no call, not a call
         // that happened to match nothing.
@@ -556,12 +563,12 @@ mod tests {
 
     #[test]
     fn skip_slots_are_not_gaps() {
-        // The reconnect window (99, 106) covers heights 100..=105, but the
+        // The reconnect window [99, 106] covers heights 99..=106, but the
         // leader skipped 102, so getBlocks never produced it. Only produced
         // blocks belong in the backfill list.
-        let fetcher = MockFetcher::new(0).with_blocks([100, 101, 103, 104, 105]);
+        let fetcher = MockFetcher::new(0).with_blocks([99, 100, 101, 103, 104, 105, 106]);
         let gaps = gap_slots(99, 106, &fetcher).expect("reachable");
-        assert_eq!(gaps, vec![100, 101, 103, 104, 105]);
+        assert_eq!(gaps, vec![99, 100, 101, 103, 104, 105, 106]);
         assert_eq!(fetcher.block_fetches(), 1);
     }
 
@@ -586,10 +593,10 @@ mod tests {
     }
 
     proptest! {
-        /// The list is exactly the produced blocks inside the open interval,
+        /// The list is exactly the produced blocks inside the closed range,
         /// in slot order, with duplicates collapsed.
         #[test]
-        fn gaps_are_the_produced_blocks_in_the_open_interval(
+        fn gaps_are_the_produced_blocks_in_the_closed_range(
             last_before in 0u64..1_000_000,
             span in 0u64..64,
             produced in prop::collection::vec(0u64..1_100_000, 0..300),
@@ -602,7 +609,7 @@ mod tests {
                 .copied()
                 .collect::<BTreeSet<u64>>()
                 .into_iter()
-                .filter(|slot| *slot > last_before && *slot < first_after)
+                .filter(|slot| *slot >= last_before && *slot <= first_after)
                 .collect();
             prop_assert_eq!(got, expected);
         }

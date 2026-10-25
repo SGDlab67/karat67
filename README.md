@@ -169,7 +169,8 @@ karat orphans --start 250000000 --end 250000100 --slots 250000000,250000002
 # Gaps: the exact backfill list after a stream reconnect. Takes the two slots
 # a disconnecting datasource knows (Carbon's DatasourceDisconnection: last
 # slot before the drop, first slot after the reconnect) and lists every block
-# the chain produced strictly between them. Skip-slots are absent by
+# the chain produced from one to the other, both ends included, since either
+# boundary slot can be partly delivered. Skip-slots are absent by
 # construction, and the summary prints Carbon's own estimate next to the real
 # count. --out writes the full list, one slot per line.
 karat gaps \
@@ -405,16 +406,18 @@ cargo run --quiet --bin karat-mcp
 
 - `karat gaps` (done): the exact backfill list for the window a disconnecting
   stream reports. Carbon 2's `DatasourceDisconnection` carries the two
-  boundary slots, but its `missed_slots` field is a height count that includes
-  leader skip-slots and both observed ends, and lists nothing. `gaps` runs
-  `getBlocks` over the open interval and emits the produced blocks, sorted and
-  deduped, which is what a replayer can consume (Carbon adapter:
-  `karat67::carbon::gaps_for_disconnection`). Measured live on mainnet: a
-  19,999-slot window produced 19,987 blocks with 12 leader skips, where
-  Carbon's formula reports 20,000; a 600,001-slot window (599,549 blocks) is
-  two `getBlocks` calls, because the fetcher chunks at the RPC's 500,000-slot
-  cap, so the 158.91 h outage (about 1.4M slots) would be three. The
-  off-by-one is drafted upstream in `updates/carbon-missed-slots-draft.md`.
+  boundary slots, but its `missed_slots` field is a height delta that includes
+  leader skip-slots, is one short of the closed range, and lists nothing.
+  `gaps` runs `getBlocks` over the closed range `[last, first]`, because either
+  boundary slot can be partly delivered, and emits the produced blocks, sorted
+  and deduped, which is what a replayer can consume (Carbon adapter:
+  `karat67::carbon::gaps_for_disconnection`). Measured live on mainnet: the
+  19,999 heights strictly between two slots held 19,987 blocks and 12 leader
+  skips, where Carbon's formula reports 20,000; a 600,001-slot window
+  (599,549 blocks) is two `getBlocks` calls, because the fetcher chunks at the
+  RPC's 500,000-slot cap, so the 158.91 h outage (about 1.4M slots) would be
+  three. The boundary problem is filed upstream as
+  [sevenlabs-hq/carbon#609](https://github.com/sevenlabs-hq/carbon/issues/609).
 - `karat sentinel` (done): the slot a program last changed at, from its
   ProgramData header in two reads, printed as the Carbon `SlotRangeFilter`
   boundary to paste, plus `--sample N` to measure what a program actually

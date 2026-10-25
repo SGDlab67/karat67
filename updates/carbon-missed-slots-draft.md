@@ -132,3 +132,14 @@ let gaps = karat67::carbon::gaps_for_disconnection(&event, &fetcher)?;
 
 For the same window, `karat gaps` prints Carbon's number next to the real one,
 so the over-count is visible per event rather than argued in a review.
+
+## Correction, 2026-10-24
+
+The off-by-one fix above is wrong. It proposed `first - last - 1` over the open
+interval. On account and transaction streams, both boundary slots can be partly
+delivered: the drop can land between two transactions of `last`, and the new
+stream can start partway through `first`. The safe backfill is the closed range
+`[last, first]`, which `getBlocks(last, first)` returns, so `first - last` is one
+short, not one long. Filed upstream with this corrected framing as
+[sevenlabs-hq/carbon#609](https://github.com/sevenlabs-hq/carbon/issues/609).
+`karat gaps` now uses the closed range too.
