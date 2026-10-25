@@ -136,6 +136,35 @@ enum Command {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
+    /// Inspect: what an account is, what it holds, and whether to trust the
+    /// decode. Reads the account, picks the type from its owner and
+    /// discriminator, checks the length, decodes the known fields, and
+    /// compares the program's deploy slot with the one the registry was
+    /// verified against.
+    ///
+    /// With `--indexed-base64`, also reconciles your stored copy against the
+    /// chain (same rules as `reconcile`).
+    ///
+    /// Exit code: 0 only when the verdict is `ok` and any indexed check
+    /// passed.
+    Inspect {
+        /// Solana JSON-RPC endpoint. Falls back to `KARAT_RPC_URL`.
+        #[arg(long, env = "KARAT_RPC_URL")]
+        rpc_url: String,
+        /// Account pubkey to inspect.
+        #[arg(long)]
+        account: String,
+        /// Your stored copy of the account bytes, base64.
+        #[arg(long = "indexed-base64")]
+        indexed_base64: Option<String>,
+        /// Slot your stored copy was written at.
+        #[arg(long = "indexed-slot", requires = "indexed_base64")]
+        indexed_slot: Option<u64>,
+        /// Slot lag tolerated on a mismatch when the account's last touch is
+        /// unknown.
+        #[arg(long = "max-slot-lag", default_value_t = DEFAULT_MAX_SLOT_LAG)]
+        max_slot_lag: u64,
+    },
     /// Sentinel: the slot a program's code last changed at, so a stale
     /// decoder has a boundary instead of a guess. Reads the ProgramData
     /// header for the deploy slot and the upgrade authority, and prints the
@@ -367,6 +396,34 @@ fn main() -> anyhow::Result<()> {
                 );
             } else {
                 print!("{}", render_gaps(&report, out.as_deref()));
+            }
+        }
+        Command::Inspect {
+            rpc_url,
+            account,
+            indexed_base64,
+            indexed_slot,
+            max_slot_lag,
+        } => {
+            let indexed = match indexed_base64 {
+                None => None,
+                Some(encoded) => Some((
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded.trim())
+                        .map_err(|e| anyhow::anyhow!("--indexed-base64 is not base64: {e}"))?,
+                    indexed_slot,
+                )),
+            };
+            let fetcher = RpcAccountFetcher::new(rpc_url);
+            let inspection =
+                karat67::inspect::inspect_account(&fetcher, &account, indexed, max_slot_lag)?;
+            if cli.json || !std::io::stdout().is_terminal() {
+                println!("{}", serde_json::to_string_pretty(&inspection.to_json())?);
+            } else {
+                print!("{}", render_inspection(&inspection));
+            }
+            if !inspection.ok() {
+                std::process::exit(1);
             }
         }
         Command::Sentinel {
@@ -716,6 +773,96 @@ fn render_account(account: &str, len: usize, results: &[CheckResult], color: boo
         let _ = writeln!(out, "  exit code 1: a pipeline or CI job stops here");
     } else {
         let _ = writeln!(out, "  exit code 1: Skipped is never green");
+    }
+    let _ = writeln!(out);
+    out
+}
+
+/// Terminal report for `inspect`: verdict first, then identity, then the
+/// decoded fields. Pure so it is testable.
+fn render_inspection(inspection: &karat67::inspect::Inspection) -> String {
+    use std::fmt::Write as _;
+    let color = std::env::var_os("NO_COLOR").is_none();
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    };
+    let json = inspection.to_json();
+    let verdict = json["verdict"].as_str().unwrap_or("?");
+    let badge = match verdict {
+        "ok" => paint("1;32", "OK"),
+        "unregistered_program" | "missing" => paint("1;33", &verdict.to_uppercase()),
+        _ => paint("1;31", &verdict.to_uppercase()),
+    };
+    let mut out = String::new();
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {}  inspect · {}",
+        paint("1;33", "karat67"),
+        inspection.account
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  {badge}  {}", inspection.reason);
+    let _ = writeln!(out);
+    let row = |out: &mut String, key: &str, value: String| {
+        let _ = writeln!(out, "  {key:<14} {value}");
+    };
+    if let (Some(program), Some(spec)) = (inspection.program, inspection.spec) {
+        row(
+            &mut out,
+            "type",
+            format!("{} {}", program.name, spec.account_type),
+        );
+    } else if let Some(owner) = &inspection.owner {
+        row(&mut out, "owner", owner.clone());
+    }
+    if let Some(len) = inspection.data_len {
+        row(&mut out, "length", format!("{} bytes", group(len)));
+    }
+    row(&mut out, "read at slot", group(inspection.slot));
+    if let Some(program) = inspection.program {
+        let deploy = inspection
+            .program_deploy_slot
+            .map(group)
+            .unwrap_or_else(|| "immutable or not read".into());
+        row(
+            &mut out,
+            "deploy slot",
+            format!(
+                "{deploy}  (registry verified at {})",
+                group(program.verified_deploy_slot)
+            ),
+        );
+    }
+    if let Some(fields) = &inspection.fields {
+        let _ = writeln!(out);
+        for (name, value) in fields {
+            let value = value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or(value.to_string());
+            let _ = writeln!(out, "    {name:<30} {value}");
+        }
+    }
+    if let Some(indexed) = &inspection.indexed {
+        let _ = writeln!(out);
+        for result in indexed {
+            let status = match result.status {
+                Status::Pass => paint("1;32", "PASS"),
+                Status::Fail => paint("1;31", "FAIL"),
+                Status::Skipped => paint("1;33", "SKIP"),
+            };
+            let _ = writeln!(out, "  indexed copy   {status}");
+            if let Some(detail) = &result.detail {
+                for line in describe(detail) {
+                    let _ = writeln!(out, "                 {line}");
+                }
+            }
+        }
     }
     let _ = writeln!(out);
     out

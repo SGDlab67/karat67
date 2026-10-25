@@ -1,10 +1,17 @@
 //! Stdio JSON-RPC server so an agent can call the integrity checks.
 //!
-//! Speaks `initialize`, `tools/list`, and `tools/call`. Two tools:
-//! `check_account`, with the same inputs as `karat account`, and `find_gaps`,
+//! Speaks `initialize`, `tools/list`, and `tools/call`. Three tools:
+//! `inspect_account`, with the same inputs as `karat inspect`;
+//! `check_account`, with the same inputs as `karat account`; and `find_gaps`,
 //! with the same inputs as `karat gaps`. Each tool's text is JSON
 //! (`{ "ok": bool, ... }`); `ok` is true only when the call completed and
-//! every result is Pass.
+//! every result is Pass (for `inspect_account`: the verdict is `ok` and any
+//! indexed check passed).
+//!
+//! `isError` marks a call that could not be answered. For `check_account`
+//! and `find_gaps` that is also any non-Pass result, as before; for
+//! `inspect_account` a non-`ok` verdict is an answer, not an error, so an
+//! agent reads the verdict instead of retrying.
 //!
 //! Input is one JSON object per line, or a `Content-Length` frame. Replies are
 //! `Content-Length` frames. No MCP SDK.
@@ -67,6 +74,20 @@ fn initialize_result(params: &Value) -> Value {
 fn tools_list() -> Value {
     json!({
         "tools": [{
+            "name": "inspect_account",
+            "description": "Read a Solana account and return what it is and what it holds, with a verdict on whether to trust the decode. Call this before acting on Kamino Lend, Orca Whirlpool, Meteora DLMM or Meteora DBC account data. verdict is one of ok, stale_registry (program redeployed since the layout was verified: fields may be wrong), layout_mismatch, unknown_layout, unregistered_program, missing. Only act on fields when ok is true. Integers wider than 32 bits are decimal strings. Pass indexed_base64 to also check your stored copy against the chain.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account": { "type": "string", "description": "Account pubkey (base58)" },
+                    "indexed_base64": { "type": "string", "description": "Optional: your stored copy of the account bytes, base64, to reconcile against the chain" },
+                    "indexed_slot": { "type": "integer", "description": "Optional: slot your copy was written at" },
+                    "max_slot_lag": { "type": "integer", "description": "Slot lag tolerated on a mismatch when the account's last touch is unknown. Default 32" },
+                    "rpc_url": { "type": "string", "description": "Solana JSON-RPC URL. Falls back to KARAT_RPC_URL" }
+                },
+                "required": ["account"]
+            }
+        }, {
             "name": "check_account",
             "description": "Shape-check indexed account bytes, then reconcile against RPC only if shape passes. ok is true only when every result is Pass. A shape failure does not call RPC.",
             "inputSchema": {
@@ -106,6 +127,7 @@ fn tools_call(params: &Value) -> Result<Value, Value> {
         return Err(error_object(-32602, "arguments must be an object"));
     }
     let payload = match name {
+        "inspect_account" => run_inspect_account(&arguments),
         "check_account" => run_check_account(&arguments),
         "find_gaps" => run_find_gaps(&arguments),
         _ => return Err(error_object(-32602, format!("unknown tool {name}"))),
@@ -116,7 +138,7 @@ fn tools_call(params: &Value) -> Result<Value, Value> {
         .map_err(|e| error_object(-32603, format!("encoding result failed: {e}")))?;
     Ok(json!({
         "content": [{ "type": "text", "text": text }],
-        "isError": !ok,
+        "isError": name != "inspect_account" && !ok,
     }))
 }
 
@@ -140,6 +162,25 @@ fn run_check_account(args: &Value) -> Result<Value, String> {
         "ok": gate::all_pass(&results),
         "results": results,
     }))
+}
+
+fn run_inspect_account(args: &Value) -> Result<Value, String> {
+    let account = required_str(args, "account")?;
+    let indexed = match args.get("indexed_base64").and_then(Value::as_str) {
+        None => None,
+        Some(encoded) => Some((
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim())
+                .map_err(|e| format!("invalid base64: {e}"))?,
+            optional_u64(args, "indexed_slot")?,
+        )),
+    };
+    let max_slot_lag = optional_u64(args, "max_slot_lag")?.unwrap_or(DEFAULT_MAX_SLOT_LAG);
+    let url = rpc_url_from(args).ok_or("missing rpc_url (or KARAT_RPC_URL)")?;
+    let fetcher = RpcAccountFetcher::new(url);
+    crate::inspect::inspect_account(&fetcher, account, indexed, max_slot_lag)
+        .map(|inspection| inspection.to_json())
+        .map_err(|e| format!("fetch failed: {e}"))
 }
 
 fn run_find_gaps(args: &Value) -> Result<Value, String> {
@@ -294,8 +335,9 @@ mod tests {
             "method": "tools/list"
         }))
         .expect("response");
-        assert_eq!(list["result"]["tools"][0]["name"], "check_account");
-        assert_eq!(list["result"]["tools"][1]["name"], "find_gaps");
+        assert_eq!(list["result"]["tools"][0]["name"], "inspect_account");
+        assert_eq!(list["result"]["tools"][1]["name"], "check_account");
+        assert_eq!(list["result"]["tools"][2]["name"], "find_gaps");
         assert!(
             handle_request(&json!({
                 "jsonrpc": "2.0",
@@ -355,6 +397,6 @@ mod tests {
         let mut output = Vec::new();
         serve(&mut Cursor::new(framed.into_bytes()), &mut output).expect("serve");
         let messages = frames(&output);
-        assert_eq!(messages[0]["result"]["tools"][0]["name"], "check_account");
+        assert_eq!(messages[0]["result"]["tools"][0]["name"], "inspect_account");
     }
 }

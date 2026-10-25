@@ -322,6 +322,27 @@ impl SlotCoverageFetcher for MockFetcher {
 pub struct RpcAccountFetcher {
     endpoint: String,
     agent: ureq::Agent,
+    /// Keys per `getMultipleAccounts` call. Starts at the protocol cap and
+    /// drops to whatever lower cap the endpoint reports (PublicNode's free
+    /// tier allows 10, measured 2026-10-23).
+    batch_limit: std::cell::Cell<usize>,
+}
+
+/// An account as `getAccountInfo` returns it: who owns it and its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawAccount {
+    /// Base58 owning program.
+    pub owner: String,
+    pub lamports: u64,
+    pub data: Vec<u8>,
+}
+
+/// The key cap an RPC names when it rejects a `getMultipleAccounts` call,
+/// read from messages like "A maximum of 10 accounts is allowed".
+pub fn reported_key_limit(message: &str) -> Option<usize> {
+    let rest = &message[message.find("maximum of ")? + "maximum of ".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok().filter(|&limit| limit > 0)
 }
 
 #[cfg(feature = "rpc")]
@@ -330,8 +351,58 @@ impl RpcAccountFetcher {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
-            agent: ureq::Agent::new_with_defaults(),
+            // Non-2xx replies are read, not thrown: providers put the reason
+            // (a key cap, a rate limit) in a JSON body on a 403 or 429.
+            agent: ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .new_agent(),
+            batch_limit: std::cell::Cell::new(MAX_GET_MULTIPLE_ACCOUNTS_KEYS),
         }
+    }
+
+    /// One account with its owner, read at `confirmed`, and the slot it was
+    /// read at. `None` means the account does not exist.
+    pub fn get_account(&self, key: &str) -> anyhow::Result<(u64, Option<RawAccount>)> {
+        use base64::Engine as _;
+
+        let result = self.rpc_call(
+            "getAccountInfo",
+            serde_json::json!([key, { "encoding": "base64", "commitment": "confirmed" }]),
+        )?;
+        let context_slot = result
+            .get("context")
+            .and_then(|context| context.get("slot"))
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("RPC response missing `result.context.slot`"))?;
+        let Some(value) = result.get("value").filter(|value| !value.is_null()) else {
+            return Ok((context_slot, None));
+        };
+        let owner = value
+            .get("owner")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("account entry missing `owner`"))?
+            .to_string();
+        let lamports = value
+            .get("lamports")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("account entry missing `lamports`"))?;
+        let encoded = value
+            .get("data")
+            .and_then(|data| data.get(0))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("account `data` is not [base64, \"base64\"]"))?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| anyhow::anyhow!("decoding base64 account data failed: {e}"))?;
+        Ok((
+            context_slot,
+            Some(RawAccount {
+                owner,
+                lamports,
+                data,
+            }),
+        ))
     }
 
     /// One JSON-RPC call, returning the `result` value.
@@ -355,12 +426,19 @@ impl RpcAccountFetcher {
             .post(&self.endpoint)
             .send_json(&request)
             .map_err(|e| anyhow::anyhow!("{method} request failed: {e}"))?;
+        let status = response.status();
         let body: serde_json::Value = response
             .body_mut()
             .with_config()
             .limit(MAX_RPC_BODY_BYTES)
             .read_json()
-            .map_err(|e| anyhow::anyhow!("reading {method} response failed: {e}"))?;
+            .map_err(|e| {
+                if status.is_success() {
+                    anyhow::anyhow!("reading {method} response failed: {e}")
+                } else {
+                    anyhow::anyhow!("{method} returned HTTP {status}")
+                }
+            })?;
 
         if let Some(error) = body.get("error") {
             anyhow::bail!("RPC returned an error: {error}");
@@ -466,11 +544,22 @@ impl RpcAccountFetcher {
 #[cfg(feature = "rpc")]
 impl AccountFetcher for RpcAccountFetcher {
     fn get_multiple_accounts(&self, keys: &[String]) -> anyhow::Result<FetchResult> {
-        get_multiple_accounts_in_batches(
-            |batch| get_multiple_accounts_once(self, batch),
-            keys,
-            MAX_GET_MULTIPLE_ACCOUNTS_KEYS,
-        )
+        loop {
+            let limit = self.batch_limit.get();
+            match get_multiple_accounts_in_batches(
+                |batch| get_multiple_accounts_once(self, batch),
+                keys,
+                limit,
+            ) {
+                Ok(result) => return Ok(result),
+                // The endpoint named a lower cap: remember it and redo the
+                // fetch in batches it accepts. Strictly lower, so this ends.
+                Err(error) => match reported_key_limit(&error.to_string()) {
+                    Some(lower) if lower < limit => self.batch_limit.set(lower),
+                    _ => return Err(error),
+                },
+            }
+        }
     }
 
     fn last_touch_slot(&self, key: &str, min_context_slot: u64) -> anyhow::Result<Option<u64>> {
@@ -570,30 +659,9 @@ impl SlotCoverageFetcher for RpcAccountFetcher {
 /// 500,000-slot chunking around this single-window request.
 #[cfg(feature = "rpc")]
 fn get_blocks_once(fetcher: &RpcAccountFetcher, start: u64, end: u64) -> anyhow::Result<Vec<u64>> {
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getBlocks",
-        "params": [start, end],
-    });
-
-    let mut response = fetcher
-        .agent
-        .post(&fetcher.endpoint)
-        .send_json(&request)
-        .map_err(|e| anyhow::anyhow!("getBlocks request failed: {e}"))?;
-    let body: serde_json::Value = response
-        .body_mut()
-        .read_json()
-        .map_err(|e| anyhow::anyhow!("reading getBlocks response failed: {e}"))?;
-
-    if let Some(error) = body.get("error") {
-        anyhow::bail!("RPC returned an error: {error}");
-    }
-
-    let values = body
-        .get("result")
-        .and_then(serde_json::Value::as_array)
+    let result = fetcher.rpc_call("getBlocks", serde_json::json!([start, end]))?;
+    let values = result
+        .as_array()
         .ok_or_else(|| anyhow::anyhow!("RPC response missing `result` array"))?;
 
     values
@@ -642,6 +710,17 @@ fn decode_account(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn reads_the_key_cap_an_endpoint_reports() {
+        let publicnode = r#"RPC returned an error: {"code":-32602,"message":"A maximum of 10 accounts is allowed. No limit on a dedicated node"}"#;
+        assert_eq!(reported_key_limit(publicnode), Some(10));
+        assert_eq!(
+            reported_key_limit("Too many inputs provided; max 100"),
+            None
+        );
+        assert_eq!(reported_key_limit("A maximum of 0 accounts"), None);
+    }
 
     #[test]
     fn batches_keys_at_the_rpc_cap_and_keeps_order() {
