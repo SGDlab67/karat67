@@ -42,6 +42,23 @@ pub trait AccountFetcher {
     /// Fetch each key's account, preserving order. Returns the batch context
     /// slot alongside one `Option<FetchedAccount>` per requested key.
     fn get_multiple_accounts(&self, keys: &[String]) -> anyhow::Result<FetchResult>;
+
+    /// Slot of the most recent transaction that referenced `key`, read from a
+    /// node that has seen at least `min_context_slot`.
+    ///
+    /// Reconciliation uses this as its reference point on a byte mismatch: if
+    /// nothing touched the account after the indexed write slot, the indexed
+    /// bytes must equal the chain's, and a mismatch is corruption, not lag.
+    /// Read-only references and failed transactions count, so the answer is
+    /// an upper bound on the last write: it can only turn a verdict into a
+    /// skip, never into a false failure.
+    ///
+    /// `Ok(None)` means unknown (no history on this node, or a fetcher with
+    /// no history at all); the caller then falls back to the slot-lag rule.
+    fn last_touch_slot(&self, key: &str, min_context_slot: u64) -> anyhow::Result<Option<u64>> {
+        let _ = (key, min_context_slot);
+        Ok(None)
+    }
 }
 
 /// Fetches confirmed block slots in a range, like Solana's `getBlocks`.
@@ -54,6 +71,55 @@ pub trait SlotCoverageFetcher {
     ///
     /// An `Err` means the fetch itself was unreachable (network, RPC error).
     fn get_blocks(&self, start: u64, end: u64) -> anyhow::Result<Vec<u64>>;
+
+    /// The highest finalized slot, when the fetcher knows it.
+    ///
+    /// `getBlocks` answers at `finalized`, so above this slot "not in
+    /// `getBlocks`" means "not finalized yet", not "never produced". The
+    /// coverage checks cap their window here. `Ok(None)` means unknown, and
+    /// the window is used as given.
+    fn finalized_slot(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+}
+
+/// Maximum keys one `getMultipleAccounts` call may carry.
+///
+/// The RPC rejects a longer list
+/// (https://solana.com/docs/rpc/http/getmultipleaccounts), so
+/// `RpcAccountFetcher::get_multiple_accounts` batches inside the fetcher, the
+/// same way `get_blocks` windows at [`MAX_GETBLOCKS_RANGE`].
+pub const MAX_GET_MULTIPLE_ACCOUNTS_KEYS: usize = 100;
+
+/// Fetch `keys` in batches of at most `max`, preserving key order.
+///
+/// Each batch is read at its own context slot. The merged result reports the
+/// oldest of them, so a reconcile verdict that holds at the merged slot holds
+/// for every account in the batch. `fetch` is the single-batch call: the RPC
+/// fetcher passes its raw request, tests pass a mock.
+pub fn get_multiple_accounts_in_batches(
+    mut fetch: impl FnMut(&[String]) -> anyhow::Result<FetchResult>,
+    keys: &[String],
+    max: usize,
+) -> anyhow::Result<FetchResult> {
+    let mut context_slot: Option<u64> = None;
+    let mut accounts = Vec::with_capacity(keys.len());
+    for batch in keys.chunks(max.max(1)) {
+        let result = fetch(batch)?;
+        anyhow::ensure!(
+            result.accounts.len() == batch.len(),
+            "getMultipleAccounts returned {} entries for {} keys",
+            result.accounts.len(),
+            batch.len()
+        );
+        context_slot =
+            Some(context_slot.map_or(result.context_slot, |slot| slot.min(result.context_slot)));
+        accounts.extend(result.accounts);
+    }
+    Ok(FetchResult {
+        context_slot: context_slot.unwrap_or_default(),
+        accounts,
+    })
 }
 
 /// Maximum slot range one `getBlocks` call may cover.
@@ -132,6 +198,10 @@ pub struct MockFetcher {
     /// `get_blocks` invocations, so a test can prove a short-circuit made no
     /// call at all rather than guessing from the result.
     block_fetches: Cell<usize>,
+    /// Last-touch slots returned by [`AccountFetcher::last_touch_slot`].
+    touches: HashMap<String, u64>,
+    /// Returned by [`SlotCoverageFetcher::finalized_slot`].
+    finalized: Option<u64>,
     unreachable: bool,
 }
 
@@ -143,6 +213,8 @@ impl MockFetcher {
             accounts: HashMap::new(),
             blocks: Vec::new(),
             block_fetches: Cell::new(0),
+            touches: HashMap::new(),
+            finalized: None,
             unreachable: false,
         }
     }
@@ -154,6 +226,8 @@ impl MockFetcher {
             accounts: HashMap::new(),
             blocks: Vec::new(),
             block_fetches: Cell::new(0),
+            touches: HashMap::new(),
+            finalized: None,
             unreachable: true,
         }
     }
@@ -177,6 +251,18 @@ impl MockFetcher {
         self.blocks.extend(blocks);
         self
     }
+
+    /// Register the slot of the last transaction that referenced `key`.
+    pub fn with_last_touch(mut self, key: impl Into<String>, slot: u64) -> Self {
+        self.touches.insert(key.into(), slot);
+        self
+    }
+
+    /// Report `slot` as the highest finalized slot.
+    pub fn with_finalized(mut self, slot: u64) -> Self {
+        self.finalized = Some(slot);
+        self
+    }
 }
 
 impl AccountFetcher for MockFetcher {
@@ -192,6 +278,13 @@ impl AccountFetcher for MockFetcher {
             context_slot: self.context_slot,
             accounts,
         })
+    }
+
+    fn last_touch_slot(&self, key: &str, _min_context_slot: u64) -> anyhow::Result<Option<u64>> {
+        if self.unreachable {
+            anyhow::bail!("mock fetcher is unreachable");
+        }
+        Ok(self.touches.get(key).copied())
     }
 }
 
@@ -210,6 +303,13 @@ impl SlotCoverageFetcher for MockFetcher {
         slots.sort_unstable();
         slots.dedup();
         Ok(slots)
+    }
+
+    fn finalized_slot(&self) -> anyhow::Result<Option<u64>> {
+        if self.unreachable {
+            anyhow::bail!("mock fetcher is unreachable");
+        }
+        Ok(self.finalized)
     }
 }
 
@@ -366,50 +466,73 @@ impl RpcAccountFetcher {
 #[cfg(feature = "rpc")]
 impl AccountFetcher for RpcAccountFetcher {
     fn get_multiple_accounts(&self, keys: &[String]) -> anyhow::Result<FetchResult> {
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getMultipleAccounts",
-            "params": [keys, { "encoding": "base64" }],
-        });
-
-        let mut response = self
-            .agent
-            .post(&self.endpoint)
-            .send_json(&request)
-            .map_err(|e| anyhow::anyhow!("getMultipleAccounts request failed: {e}"))?;
-        let body: serde_json::Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|e| anyhow::anyhow!("reading getMultipleAccounts response failed: {e}"))?;
-
-        if let Some(error) = body.get("error") {
-            anyhow::bail!("RPC returned an error: {error}");
-        }
-
-        let result = body
-            .get("result")
-            .ok_or_else(|| anyhow::anyhow!("RPC response missing `result`"))?;
-        let context_slot = result
-            .get("context")
-            .and_then(|context| context.get("slot"))
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("RPC response missing `result.context.slot`"))?;
-        let values = result
-            .get("value")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("RPC response missing `result.value` array"))?;
-
-        let accounts = values
-            .iter()
-            .map(|value| decode_account(value, context_slot))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        Ok(FetchResult {
-            context_slot,
-            accounts,
-        })
+        get_multiple_accounts_in_batches(
+            |batch| get_multiple_accounts_once(self, batch),
+            keys,
+            MAX_GET_MULTIPLE_ACCOUNTS_KEYS,
+        )
     }
+
+    fn last_touch_slot(&self, key: &str, min_context_slot: u64) -> anyhow::Result<Option<u64>> {
+        // minContextSlot keeps a load-balanced endpoint from answering off a
+        // node older than the account read: a stale node would report an old
+        // last touch and turn lag into a false corruption verdict.
+        let result = self.rpc_call(
+            "getSignaturesForAddress",
+            serde_json::json!([key, {
+                "limit": 1,
+                "commitment": "confirmed",
+                "minContextSlot": min_context_slot,
+            }]),
+        )?;
+        let entries = result
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("getSignaturesForAddress result is not an array"))?;
+        match entries.first() {
+            None => Ok(None),
+            Some(entry) => entry
+                .get("slot")
+                .and_then(serde_json::Value::as_u64)
+                .map(Some)
+                .ok_or_else(|| anyhow::anyhow!("signature entry missing `slot`: {entry}")),
+        }
+    }
+}
+
+/// One raw `getMultipleAccounts` call for at most
+/// [`MAX_GET_MULTIPLE_ACCOUNTS_KEYS`] keys.
+///
+/// Read at `confirmed`: the RPC default is `finalized`, about 32 slots behind
+/// the tip, and an indexer streaming at `processed` or `confirmed` would sit
+/// ahead of every read.
+#[cfg(feature = "rpc")]
+fn get_multiple_accounts_once(
+    fetcher: &RpcAccountFetcher,
+    keys: &[String],
+) -> anyhow::Result<FetchResult> {
+    let result = fetcher.rpc_call(
+        "getMultipleAccounts",
+        serde_json::json!([keys, { "encoding": "base64", "commitment": "confirmed" }]),
+    )?;
+    let context_slot = result
+        .get("context")
+        .and_then(|context| context.get("slot"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("RPC response missing `result.context.slot`"))?;
+    let values = result
+        .get("value")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("RPC response missing `result.value` array"))?;
+
+    let accounts = values
+        .iter()
+        .map(|value| decode_account(value, context_slot))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(FetchResult {
+        context_slot,
+        accounts,
+    })
 }
 
 #[cfg(feature = "rpc")]
@@ -427,6 +550,17 @@ impl SlotCoverageFetcher for RpcAccountFetcher {
             end,
             MAX_GETBLOCKS_RANGE,
         )
+    }
+
+    fn finalized_slot(&self) -> anyhow::Result<Option<u64>> {
+        let result = self.rpc_call(
+            "getSlot",
+            serde_json::json!([{ "commitment": "finalized" }]),
+        )?;
+        result
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("getSlot result is not a u64: {result}"))
     }
 }
 
@@ -508,6 +642,75 @@ fn decode_account(
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn batches_keys_at_the_rpc_cap_and_keeps_order() {
+        let keys: Vec<String> = (0..250).map(|i| format!("k{i}")).collect();
+        let mut sizes = Vec::new();
+        // Each batch answers at a different context slot; the merged result
+        // must report the oldest.
+        let result = get_multiple_accounts_in_batches(
+            |batch| {
+                sizes.push(batch.len());
+                Ok(FetchResult {
+                    context_slot: 1000 - sizes.len() as u64,
+                    accounts: batch
+                        .iter()
+                        .map(|key| {
+                            Some(FetchedAccount {
+                                data: key.as_bytes().to_vec(),
+                                slot: 0,
+                            })
+                        })
+                        .collect(),
+                })
+            },
+            &keys,
+            MAX_GET_MULTIPLE_ACCOUNTS_KEYS,
+        )
+        .expect("reachable");
+        assert_eq!(sizes, vec![100, 100, 50]);
+        assert_eq!(result.context_slot, 997);
+        assert_eq!(result.accounts.len(), 250);
+        assert_eq!(result.accounts[249].as_ref().unwrap().data, b"k249");
+    }
+
+    #[test]
+    fn a_failing_batch_fails_the_whole_fetch() {
+        let keys: Vec<String> = (0..150).map(|i| format!("k{i}")).collect();
+        let mut calls = 0;
+        let result = get_multiple_accounts_in_batches(
+            |batch| {
+                calls += 1;
+                if calls == 2 {
+                    anyhow::bail!("rpc down");
+                }
+                Ok(FetchResult {
+                    context_slot: 1,
+                    accounts: vec![None; batch.len()],
+                })
+            },
+            &keys,
+            MAX_GET_MULTIPLE_ACCOUNTS_KEYS,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_short_batch_reply_is_an_error_not_a_misaligned_result() {
+        let keys: Vec<String> = (0..3).map(|i| format!("k{i}")).collect();
+        let result = get_multiple_accounts_in_batches(
+            |_| {
+                Ok(FetchResult {
+                    context_slot: 1,
+                    accounts: vec![None],
+                })
+            },
+            &keys,
+            MAX_GET_MULTIPLE_ACCOUNTS_KEYS,
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn mock_returns_registered_account() {

@@ -32,12 +32,24 @@ pub type SampleRow = (String, Vec<u8>, Option<u64>);
 /// - bytes equal -> `Pass`
 /// - account absent on chain (`None`) -> `Fail`
 /// - bytes differ, no indexed slot -> `Fail`
-/// - bytes differ, `delta == 0` -> `Fail`
-/// - bytes differ, `0 < delta <= max_slot_lag` -> `Skipped` (slot lag)
-/// - bytes differ, `delta > max_slot_lag` -> `Fail`
+/// - bytes differ, chain read older than the indexed slot -> `Skipped`
+///   (`"reason":"rpc behind index"`): the RPC has not seen that write yet
+/// - bytes differ, last touch known (see below):
+///   - nothing touched the account after the indexed slot -> `Fail`, at any
+///     lag: the bytes cannot have legitimately changed
+///   - touched after the indexed slot -> `Skipped`
+///     (`"reason":"written after indexed slot"`): the indexer is behind on
+///     this account, which is staleness, not corruption
+/// - bytes differ, last touch unknown (no history, lookup failed) ->
+///   the slot-lag rule:
+///   - `delta == 0` -> `Fail`
+///   - `0 < delta <= max_slot_lag` -> `Skipped` (`"reason":"slot lag"`)
+///   - `delta > max_slot_lag` -> `Fail`
 /// - the fetch itself was unreachable -> `Skipped` for every account
 ///
-/// `delta` is `context_slot.saturating_sub(indexed_slot)`.
+/// `delta` is `context_slot - indexed_slot`. The last touch is
+/// [`AccountFetcher::last_touch_slot`], asked only for mismatched rows, so a
+/// clean sample costs no extra calls.
 pub fn reconcile(
     sample: &[SampleRow],
     fetcher: &dyn AccountFetcher,
@@ -69,6 +81,7 @@ pub fn reconcile(
                     onchain.as_ref(),
                     context_slot,
                     max_slot_lag,
+                    fetcher,
                 )
             })
             .collect(),
@@ -83,6 +96,7 @@ fn reconcile_one(
     onchain: Option<&FetchedAccount>,
     context_slot: u64,
     max_slot_lag: u64,
+    fetcher: &dyn AccountFetcher,
 ) -> CheckResult {
     let name = format!("reconcile({key})");
 
@@ -110,10 +124,19 @@ fn reconcile_one(
         return CheckResult::fail(name, detail.to_string());
     };
 
-    let delta = context_slot.saturating_sub(write_slot);
-
-    if delta == 0 || delta > max_slot_lag {
+    if context_slot < write_slot {
         let detail = serde_json::json!({
+            "reason": "rpc behind index",
+            "account": key,
+            "indexed_slot": write_slot,
+            "context_slot": context_slot,
+            "first_diff_offset": first_diff_offset,
+        });
+        return CheckResult::skipped(name, detail.to_string());
+    }
+
+    let mismatch = |last_touch: Option<u64>| {
+        let mut detail = serde_json::json!({
             "account": key,
             "indexed_len": indexed.len(),
             "onchain_len": onchain.data.len(),
@@ -121,7 +144,34 @@ fn reconcile_one(
             "context_slot": context_slot,
             "indexed_slot": write_slot,
         });
-        return CheckResult::fail(name, detail.to_string());
+        if let Some(last_touch) = last_touch {
+            detail["last_touch_slot"] = last_touch.into();
+        }
+        CheckResult::fail(name.clone(), detail.to_string())
+    };
+
+    // The last touch decides when it is known. Unknown history, or a lookup
+    // that failed, falls through to the slot-lag rule: a failed second call
+    // must not change the verdict the first one supports.
+    if let Ok(Some(last_touch)) = fetcher.last_touch_slot(key, context_slot) {
+        if last_touch <= write_slot {
+            return mismatch(Some(last_touch));
+        }
+        let detail = serde_json::json!({
+            "reason": "written after indexed slot",
+            "account": key,
+            "indexed_slot": write_slot,
+            "last_touch_slot": last_touch,
+            "context_slot": context_slot,
+            "first_diff_offset": first_diff_offset,
+        });
+        return CheckResult::skipped(name, detail.to_string());
+    }
+
+    let delta = context_slot - write_slot;
+
+    if delta == 0 || delta > max_slot_lag {
+        return mismatch(None);
     }
 
     // 0 < delta <= max_slot_lag: lag-tolerated mismatch — Skipped, never Pass.
@@ -374,5 +424,95 @@ mod tests {
         assert_eq!(results[1].status, Status::Fail); // delta 0
         assert_eq!(results[2].status, Status::Fail); // missing
         assert_eq!(results[3].status, Status::Skipped); // lag 10
+    }
+
+    fn detail_of(result: &CheckResult) -> serde_json::Value {
+        serde_json::from_str(result.detail.as_ref().expect("detail present"))
+            .expect("detail is JSON")
+    }
+
+    #[test]
+    fn chain_read_older_than_indexed_slot_is_skipped_not_failed() {
+        // An indexer streaming at confirmed wrote slot 520; the RPC answered
+        // from slot 500. The chain read cannot contain that write yet.
+        let fetcher = MockFetcher::new(500).with_account("acct1", vec![9, 9], 500);
+        let results = reconcile(
+            &sample(&[("acct1", vec![1, 1], Some(520))]),
+            &fetcher,
+            DEFAULT_MAX_SLOT_LAG,
+        );
+        assert_eq!(results[0].status, Status::Skipped);
+        let detail = detail_of(&results[0]);
+        assert_eq!(detail["reason"], "rpc behind index");
+        assert_eq!(detail["indexed_slot"], 520);
+        assert_eq!(detail["context_slot"], 500);
+    }
+
+    #[test]
+    fn untouched_since_indexed_slot_fails_even_inside_the_lag_window() {
+        // delta 10 would be lag-tolerated, but nothing touched the account
+        // after slot 990: the indexed bytes are simply wrong.
+        let fetcher = MockFetcher::new(1000)
+            .with_account("acct1", vec![9, 9], 1000)
+            .with_last_touch("acct1", 980);
+        let results = reconcile(
+            &sample(&[("acct1", vec![1, 1], Some(990))]),
+            &fetcher,
+            DEFAULT_MAX_SLOT_LAG,
+        );
+        assert_eq!(results[0].status, Status::Fail);
+        let detail = detail_of(&results[0]);
+        assert_eq!(detail["last_touch_slot"], 980);
+        assert_eq!(detail["indexed_slot"], 990);
+    }
+
+    #[test]
+    fn touched_exactly_at_indexed_slot_is_still_a_fail() {
+        let fetcher = MockFetcher::new(1000)
+            .with_account("acct1", vec![9], 1000)
+            .with_last_touch("acct1", 990);
+        let results = reconcile(&sample(&[("acct1", vec![1], Some(990))]), &fetcher, 32);
+        assert_eq!(results[0].status, Status::Fail);
+    }
+
+    #[test]
+    fn written_after_indexed_slot_is_skipped_even_beyond_the_lag_window() {
+        // delta 500 would Fail under the lag rule, but the account changed at
+        // slot 1400: the indexer is behind, not corrupt.
+        let fetcher = MockFetcher::new(1500)
+            .with_account("acct1", vec![9], 1500)
+            .with_last_touch("acct1", 1400);
+        let results = reconcile(
+            &sample(&[("acct1", vec![1], Some(1000))]),
+            &fetcher,
+            DEFAULT_MAX_SLOT_LAG,
+        );
+        assert_eq!(results[0].status, Status::Skipped);
+        let detail = detail_of(&results[0]);
+        assert_eq!(detail["reason"], "written after indexed slot");
+        assert_eq!(detail["last_touch_slot"], 1400);
+    }
+
+    #[test]
+    fn unknown_last_touch_falls_back_to_the_slot_lag_rule() {
+        let fetcher = MockFetcher::new(1100).with_account("acct1", vec![9], 1100);
+        let results = reconcile(
+            &sample(&[("acct1", vec![1], Some(1000))]),
+            &fetcher,
+            DEFAULT_MAX_SLOT_LAG,
+        );
+        assert_eq!(results[0].status, Status::Fail);
+        assert!(detail_of(&results[0]).get("last_touch_slot").is_none());
+    }
+
+    #[test]
+    fn equal_bytes_pass_whatever_the_last_touch() {
+        // A registered last touch after the indexed slot would turn a
+        // mismatch into Skipped; equal bytes must not consult it at all.
+        let fetcher = MockFetcher::new(1000)
+            .with_account("acct1", vec![1], 1000)
+            .with_last_touch("acct1", 999);
+        let results = reconcile(&sample(&[("acct1", vec![1], Some(500))]), &fetcher, 32);
+        assert_eq!(results[0].status, Status::Pass);
     }
 }

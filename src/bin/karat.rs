@@ -60,7 +60,8 @@ enum Command {
         #[arg(long = "indexed-slot")]
         indexed_slots: Vec<u64>,
         /// Maximum context_slot − indexed_slot lag tolerated on a byte
-        /// mismatch before failing. Within this window a mismatch is
+        /// mismatch before failing, used only when the node has no history
+        /// for the account's last touch. Within this window a mismatch is
         /// Skipped (never Pass); the process still exits non-zero.
         #[arg(long = "max-slot-lag", default_value_t = DEFAULT_MAX_SLOT_LAG)]
         max_slot_lag: u64,
@@ -187,7 +188,8 @@ enum Command {
         #[arg(long)]
         indexed_slot: Option<u64>,
         /// Maximum context_slot − indexed_slot lag tolerated on a byte
-        /// mismatch before failing. Within this window a mismatch is
+        /// mismatch before failing, used only when the node has no history
+        /// for the account's last touch. Within this window a mismatch is
         /// Skipped (never Pass).
         #[arg(long = "max-slot-lag", default_value_t = DEFAULT_MAX_SLOT_LAG)]
         max_slot_lag: u64,
@@ -727,7 +729,24 @@ fn describe(detail: &str) -> Vec<String> {
     };
     let num = |key: &str| v[key].as_u64().map(group).unwrap_or_else(|| "?".into());
     let mut lines = Vec::new();
-    if v["reason"] == "slot lag" {
+    if v["reason"] == "rpc behind index" {
+        lines.push(format!(
+            "bytes differ at offset {}, but the indexed write is at slot {}",
+            num("first_diff_offset"),
+            num("indexed_slot")
+        ));
+        lines.push("the RPC has not reached that slot yet: recheck".into());
+    } else if v["reason"] == "written after indexed slot" {
+        lines.push(format!(
+            "bytes differ at offset {}; account written again at slot {}",
+            num("first_diff_offset"),
+            num("last_touch_slot")
+        ));
+        lines.push(format!(
+            "indexer is behind on this account (indexed at {}), not corrupt",
+            num("indexed_slot")
+        ));
+    } else if v["reason"] == "slot lag" {
         lines.push(format!(
             "bytes differ at offset {}, indexer {} slots behind",
             num("first_diff_offset"),
@@ -743,6 +762,12 @@ fn describe(detail: &str) -> Vec<String> {
             "indexed {} bytes, on-chain {} bytes",
             num("indexed_len"),
             num("onchain_len")
+        ));
+    }
+    if v["last_touch_slot"].is_u64() && v["reason"].is_null() {
+        lines.push(format!(
+            "untouched since slot {}, before the indexed write: corrupt, not lag",
+            num("last_touch_slot")
         ));
     }
     lines.push(format!("chain read at slot {}", num("context_slot")));
